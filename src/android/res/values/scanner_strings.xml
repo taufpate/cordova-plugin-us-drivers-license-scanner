@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  String Resources for Driver License Scanner
+-->
+<resources>
+
+    <!-- Scanner Instructions -->
+    <string name="scanner_instruction_front">Position the FRONT of your driver license</string>
+    <string name="scanner_instruction_back">Position the BACK of your driver license</string>
+    <string name="scanner_instruction_align">Align the license within the frame</string>
+    <string name="scanner_instruction_barcode">Align the barcode within the frame</string>
+
+    <!-- Flip Instruction -->
+    <string name="scanner_flip_title">Front captured!</string>
+    <string name="scanner_flip_message">Please flip your license to scan the back</string>
+    <string name="scanner_flip_auto">Scanning will continue automatically</string>
+
+    <!-- Processing -->
+    <string name="scanner_processing">Processing…</string>
+    <string name="scanner_analyzing">Analyzing license data</string>
+
+    <!-- Success -->
+    <string name="scanner_complete">Scan complete!</string>
+
+    <!-- Errors -->
+    <string name="scanner_error_title">Scan failed</string>
+    <string name="scanner_error_camera">Camera not available</string>
+    <string name="scanner_error_permission">Camera permission required</string>
+    <string name="scanner_error_barcode">Could not detect barcode</string>
+    <string name="scanner_error_timeout">Scan timed out</string>
+
+    <!-- Buttons -->
+    <string name="scanner_btn_flash_on">Flash On</string>
+    <string name="scanner_btn_flash_off">Flash Off</string>
+    <string name="scanner_btn_cancel">Cancel</string>
+    <string name="scanner_btn_retry">Retry</string>
+
+    <!-- Accessibility -->
+    <string name="scanner_a11y_camera_preview">Camera preview</string>
+    <string name="scanner_a11y_scan_frame">License scan area</string>
+    <string name="scanner_a11y_flip_icon">Flip card icon</string>
+    <string name="scanner_a11y_capture">Capture image</string>
+
+</resources>

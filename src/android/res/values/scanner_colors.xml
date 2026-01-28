@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Color Resources for Driver License Scanner
+-->
+<resources>
+
+    <!-- Primary Colors -->
+    <color name="scanner_primary">#2196F3</color>
+    <color name="scanner_primary_dark">#1976D2</color>
+    <color name="scanner_accent">#00C853</color>
+
+    <!-- Background Colors -->
+    <color name="scanner_background">#000000</color>
+    <color name="scanner_overlay">#80000000</color>
+    <color name="scanner_card_background">#1A1A1A</color>
+
+    <!-- Frame Colors -->
+    <color name="scanner_frame_default">#FFFFFF</color>
+    <color name="scanner_frame_success">#00C853</color>
+    <color name="scanner_frame_error">#F44336</color>
+    <color name="scanner_frame_warning">#FFC107</color>
+
+    <!-- Text Colors -->
+    <color name="scanner_text_primary">#FFFFFF</color>
+    <color name="scanner_text_secondary">#CCCCCC</color>
+    <color name="scanner_text_hint">#888888</color>
+
+    <!-- Button Colors -->
+    <color name="scanner_button_background">#333333</color>
+    <color name="scanner_button_pressed">#4D4D4D</color>
+    <color name="scanner_button_disabled">#1A1A1A</color>
+    <color name="scanner_button_border">#555555</color>
+
+    <!-- Status Colors -->
+    <color name="scanner_status_success">#00C853</color>
+    <color name="scanner_status_error">#F44336</color>
+    <color name="scanner_status_warning">#FFC107</color>
+    <color name="scanner_status_info">#2196F3</color>
+
+</resources>

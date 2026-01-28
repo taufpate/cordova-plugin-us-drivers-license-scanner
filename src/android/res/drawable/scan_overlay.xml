@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Scan Overlay Drawable
+  Creates a card-shaped frame with rounded corners and a visible border.
+  Used to guide users in positioning their driver license.
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Outer border (visible frame) -->
+    <item>
+        <shape android:shape="rectangle">
+            <stroke
+                android:width="3dp"
+                android:color="#FFFFFF" />
+            <corners android:radius="12dp" />
+            <solid android:color="@android:color/transparent" />
+        </shape>
+    </item>
+
+    <!-- Corner indicators (top-left) -->
+    <item
+        android:left="0dp"
+        android:top="0dp"
+        android:right="0dp"
+        android:bottom="0dp">
+        <layer-list>
+            <!-- Top-left corner -->
+            <item
+                android:width="40dp"
+                android:height="4dp"
+                android:gravity="top|left">
+                <shape android:shape="rectangle">
+                    <solid android:color="#00C853" />
+                    <corners
+                        android:topLeftRadius="12dp"
+                        android:topRightRadius="2dp" />
+                </shape>
+            </item>
+            <item
+                android:width="4dp"
+                android:height="40dp"
+                android:gravity="top|left">
+                <shape android:shape="rectangle">
+                    <solid android:color="#00C853" />
+                    <corners
+                        android:topLeftRadius="12dp"
+                        android:bottomLeftRadius="2dp" />
+                </shape>
+            </item>
+
+            <!-- Top-right corner -->
+            <item
+                android:width="40dp"
+                android:height="4dp"
+                android:gravity="top|right">
+                <shape android:shape="rectangle">
+                    <solid android:color="#00C853" />
+                    <corners
+                        android:topLeftRadius="2dp"
+                        android:topRightRadius="12dp" />
+                </shape>
+            </item>
+            <item
+                android:width="4dp"
+                android:height="40dp"
+                android:gravity="top|right">
+                <shape android:shape="rectangle">
+                    <solid android:color="#00C853" />
+                    <corners
+                        android:topRightRadius="12dp"
+                        android:bottomRightRadius="2dp" />
+                </shape>
+            </item>
+
+            <!-- Bottom-left corner -->
+            <item
+                android:width="40dp"
+                android:height="4dp"
+                android:gravity="bottom|left">
+                <shape android:shape="rectangle">
+                    <solid android:color="#00C853" />
+                    <corners
+                        android:topLeftRadius="2dp"
+                        android:bottomLeftRadius="12dp" />
+                </shape>
+            </item>
+            <item
+                android:width="4dp"
+                android:height="40dp"
+                android:gravity="bottom|left">
+                <shape android:shape="rectangle">
+                    <solid android:color="#00C853" />
+                    <corners
+                        android:topLeftRadius="2dp"
+                        android:bottomLeftRadius="12dp" />
+                </shape>
+            </item>
+
+            <!-- Bottom-right corner -->
+            <item
+                android:width="40dp"
+                android:height="4dp"
+                android:gravity="bottom|right">
+                <shape android:shape="rectangle">
+                    <solid android:color="#00C853" />
+                    <corners
+                        android:topRightRadius="2dp"
+                        android:bottomRightRadius="12dp" />
+                </shape>
+            </item>
+            <item
+                android:width="4dp"
+                android:height="40dp"
+                android:gravity="bottom|right">
+                <shape android:shape="rectangle">
+                    <solid android:color="#00C853" />
+                    <corners
+                        android:topRightRadius="2dp"
+                        android:bottomRightRadius="12dp" />
+                </shape>
+            </item>
+        </layer-list>
+    </item>
+
+</layer-list>

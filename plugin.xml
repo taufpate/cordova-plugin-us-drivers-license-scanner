@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Cordova Plugin: US Drivers License Scanner
+  Scans and parses US Driver Licenses using PDF417 barcodes
+  Uses ZXing for barcode decoding, fully offline, no paid SDKs
+-->
+<plugin xmlns="http://apache.org/cordova/ns/plugins/1.0"
+        xmlns:android="http://schemas.android.com/apk/res/android"
+        id="cordova-plugin-us-drivers-license-scanner"
+        version="1.0.0">
+
+    <name>US Drivers License Scanner</name>
+    <description>Scans US Driver Licenses using PDF417 barcodes with guided scan flow</description>
+    <license>MIT</license>
+    <keywords>cordova,driver,license,scanner,pdf417,aamva,barcode</keywords>
+
+    <js-module src="www/DriversLicenseScanner.js" name="DriversLicenseScanner">
+        <clobbers target="cordova.plugins.DriversLicenseScanner" />
+    </js-module>
+
+    <!-- Android Platform -->
+    <platform name="android">
+        <config-file target="res/xml/config.xml" parent="/*">
+            <feature name="DriversLicenseScanner">
+                <param name="android-package" value="com.sos.driverslicensescanner.DriversLicenseScannerPlugin" />
+            </feature>
+        </config-file>
+
+        <config-file target="AndroidManifest.xml" parent="/*">
+            <uses-permission android:name="android.permission.CAMERA" />
+            <uses-feature android:name="android.hardware.camera" android:required="true" />
+            <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+        </config-file>
+
+        <config-file target="AndroidManifest.xml" parent="/manifest/application">
+            <activity
+                android:name="com.sos.driverslicensescanner.ScannerActivity"
+                android:theme="@style/Theme.AppCompat.NoActionBar"
+                android:screenOrientation="portrait"
+                android:configChanges="orientation|screenSize"
+                android:exported="false" />
+        </config-file>
+
+        <!-- Plugin Source Files -->
+        <source-file src="src/android/DriversLicenseScannerPlugin.java" target-dir="src/com/sos/driverslicensescanner" />
+        <source-file src="src/android/ScannerActivity.java" target-dir="src/com/sos/driverslicensescanner" />
+        <source-file src="src/android/CameraManager.java" target-dir="src/com/sos/driverslicensescanner" />
+        <source-file src="src/android/BarcodeAnalyzer.java" target-dir="src/com/sos/driverslicensescanner" />
+        <source-file src="src/android/AAMVAParser.java" target-dir="src/com/sos/driverslicensescanner" />
+        <source-file src="src/android/FaceDetectorHelper.java" target-dir="src/com/sos/driverslicensescanner" />
+        <source-file src="src/android/ScanResult.java" target-dir="src/com/sos/driverslicensescanner" />
+        <source-file src="src/android/ImageUtils.java" target-dir="src/com/sos/driverslicensescanner" />
+
+        <!-- Layout Files -->
+        <source-file src="src/android/res/layout/activity_scanner.xml" target-dir="res/layout" />
+
+        <!-- Drawable Files -->
+        <source-file src="src/android/res/drawable/scan_overlay.xml" target-dir="res/drawable" />
+        <source-file src="src/android/res/drawable/rounded_button.xml" target-dir="res/drawable" />
+
+        <!-- String Resources -->
+        <source-file src="src/android/res/values/scanner_strings.xml" target-dir="res/values" />
+        <source-file src="src/android/res/values/scanner_colors.xml" target-dir="res/values" />
+
+        <!-- Dependencies -->
+        <framework src="com.google.zxing:core:3.5.2" />
+        <framework src="androidx.camera:camera-core:1.3.1" />
+        <framework src="androidx.camera:camera-camera2:1.3.1" />
+        <framework src="androidx.camera:camera-lifecycle:1.3.1" />
+        <framework src="androidx.camera:camera-view:1.3.1" />
+        <framework src="com.google.mlkit:face-detection:16.1.5" />
+        <framework src="androidx.appcompat:appcompat:1.6.1" />
+        <framework src="androidx.constraintlayout:constraintlayout:2.1.4" />
+        <framework src="com.google.android.material:material:1.11.0" />
+
+        <!-- Gradle Configuration -->
+        <preference name="GradlePluginKotlinEnabled" value="true" />
+        <preference name="GradlePluginKotlinCodeStyle" value="official" />
+        <preference name="GradlePluginKotlinVersion" value="1.9.10" />
+    </platform>
+
+    <!-- iOS Platform -->
+    <platform name="ios">
+        <config-file target="config.xml" parent="/*">
+            <feature name="DriversLicenseScanner">
+                <param name="ios-package" value="DriversLicenseScannerPlugin" />
+            </feature>
+        </config-file>
+
+        <config-file target="*-Info.plist" parent="NSCameraUsageDescription">
+            <string>This app requires camera access to scan driver licenses</string>
+        </config-file>
+
+        <!-- Plugin Header Files -->
+        <header-file src="src/ios/DriversLicenseScannerPlugin.h" />
+        <header-file src="src/ios/ScannerViewController.h" />
+        <header-file src="src/ios/CameraManager.h" />
+        <header-file src="src/ios/BarcodeDecoder.h" />
+        <header-file src="src/ios/AAMVAParser.h" />
+        <header-file src="src/ios/FaceDetectorHelper.h" />
+        <header-file src="src/ios/ScanResult.h" />
+        <header-file src="src/ios/ImageUtils.h" />
+
+        <!-- Plugin Source Files -->
+        <source-file src="src/ios/DriversLicenseScannerPlugin.m" />
+        <source-file src="src/ios/ScannerViewController.m" />
+        <source-file src="src/ios/CameraManager.m" />
+        <source-file src="src/ios/BarcodeDecoder.m" />
+        <source-file src="src/ios/AAMVAParser.m" />
+        <source-file src="src/ios/FaceDetectorHelper.m" />
+        <source-file src="src/ios/ScanResult.m" />
+        <source-file src="src/ios/ImageUtils.m" />
+
+        <!-- Frameworks -->
+        <framework src="AVFoundation.framework" />
+        <framework src="CoreMedia.framework" />
+        <framework src="CoreVideo.framework" />
+        <framework src="Vision.framework" />
+        <framework src="CoreImage.framework" />
+        <framework src="UIKit.framework" />
+        <framework src="Foundation.framework" />
+        <framework src="Accelerate.framework" />
+
+        <!-- ZXingObjC Pod -->
+        <podspec>
+            <config>
+                <source url="https://cdn.cocoapods.org/"/>
+            </config>
+            <pods use-frameworks="true">
+                <pod name="ZXingObjC" spec="3.6.9" />
+            </pods>
+        </podspec>
+
+        <preference name="deployment-target" value="13.0" />
+    </platform>
+
+</plugin>

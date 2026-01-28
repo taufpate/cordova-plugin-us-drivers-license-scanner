@@ -1,0 +1,44 @@
+{
+  "name": "cordova-plugin-us-drivers-license-scanner",
+  "version": "1.0.0",
+  "description": "Cordova plugin for scanning US Driver Licenses using PDF417 barcodes with guided scan flow",
+  "cordova": {
+    "id": "cordova-plugin-us-drivers-license-scanner",
+    "platforms": [
+      "android",
+      "ios"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "keywords": [
+    "cordova",
+    "ecosystem:cordova",
+    "cordova-android",
+    "cordova-ios",
+    "driver-license",
+    "pdf417",
+    "barcode",
+    "scanner",
+    "aamva",
+    "zxing"
+  ],
+  "author": "SOS Development Team",
+  "license": "MIT",
+  "engines": {
+    "cordovaDependencies": {
+      "1.0.0": {
+        "cordova": ">=10.0.0",
+        "cordova-android": ">=14.0.0",
+        "cordova-ios": ">=7.0.0"
+      }
+    }
+  },
+  "devDependencies": {},
+  "peerDependencies": {
+    "cordova-android": ">=14.0.0",
+    "cordova-ios": ">=7.0.0"
+  }
+}
