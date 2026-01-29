@@ -59,11 +59,11 @@ static NSString *const kErrorUnknown = @"UNKNOWN_ERROR";
     AVAuthorizationStatus status = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
 
     switch (status) {
-        case AVAuthorizationStatusAuthorized:
+        case AVAuthorizationStatusAuthorized: {
             [self launchScanner];
             break;
-
-        case AVAuthorizationStatusNotDetermined:
+        }
+        case AVAuthorizationStatusNotDetermined: {
             // Request permission
             [AVCaptureDevice requestAccessForMediaType:AVMediaTypeVideo completionHandler:^(BOOL granted) {
                 dispatch_async(dispatch_get_main_queue(), ^{
@@ -76,12 +76,13 @@ static NSString *const kErrorUnknown = @"UNKNOWN_ERROR";
                 });
             }];
             break;
-
+        }
         case AVAuthorizationStatusDenied:
-        case AVAuthorizationStatusRestricted:
+        case AVAuthorizationStatusRestricted: {
             [self sendErrorResult:kErrorCameraPermissionDenied
                           message:@"Camera permission denied. Please enable in Settings."];
             break;
+        }
     }
 }
 

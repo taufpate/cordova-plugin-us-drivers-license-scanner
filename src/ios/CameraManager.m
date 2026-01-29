@@ -204,8 +204,8 @@
     dispatch_async(self.sessionQueue, ^{
         AVCapturePhotoSettings *settings = [AVCapturePhotoSettings photoSettings];
 
-        // Configure flash if needed
-        if ([self.captureDevice hasFlash] && [self.captureDevice isFlashModeSupported:AVCaptureFlashModeAuto]) {
+        // Configure flash if supported (using AVCapturePhotoOutput API)
+        if ([self.captureDevice hasFlash] && [self.photoOutput.supportedFlashModes containsObject:@(AVCaptureFlashModeAuto)]) {
             settings.flashMode = AVCaptureFlashModeAuto;
         }
 

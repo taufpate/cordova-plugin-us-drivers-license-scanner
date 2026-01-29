@@ -50,7 +50,7 @@ static NSTimeInterval const kDebounceInterval = 1.0;
     hints.tryHarder = YES;
 
     // Use ISO-8859-1 character set (common for AAMVA data)
-    hints.assumedCharacterSet = @"ISO-8859-1";
+    hints.encoding = NSISOLatin1StringEncoding;
 
     self.reader = [ZXMultiFormatReader reader];
 

@@ -72,11 +72,6 @@
         <framework src="androidx.appcompat:appcompat:1.6.1" />
         <framework src="androidx.constraintlayout:constraintlayout:2.1.4" />
         <framework src="com.google.android.material:material:1.11.0" />
-
-        <!-- Gradle Configuration -->
-        <preference name="GradlePluginKotlinEnabled" value="true" />
-        <preference name="GradlePluginKotlinCodeStyle" value="official" />
-        <preference name="GradlePluginKotlinVersion" value="1.9.10" />
     </platform>
 
     <!-- iOS Platform -->
@@ -130,8 +125,6 @@
                 <pod name="ZXingObjC" spec="3.6.9" />
             </pods>
         </podspec>
-
-        <preference name="deployment-target" value="13.0" />
     </platform>
 
 </plugin>
