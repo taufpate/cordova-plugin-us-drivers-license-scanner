@@ -2,6 +2,8 @@
  * ScannerViewController.m
  *
  * View controller implementation for the guided driver license scanning flow.
+ * Front scan: waits for face detection before capturing.
+ * Back scan: reads PDF417 barcode from video frames.
  */
 
 #import "ScannerViewController.h"
@@ -11,6 +13,13 @@
 #import "AAMVAParser.h"
 #import "ImageUtils.h"
 #import <AudioToolbox/AudioToolbox.h>
+#import <Vision/Vision.h>
+
+// Face detection runs every Nth video frame to save CPU
+static NSInteger const kFaceCheckInterval = 5;
+
+// If no face is found within this time, capture anyway as fallback
+static NSTimeInterval const kFaceDetectionFallbackTimeout = 10.0;
 
 @interface ScannerViewController () <CameraManagerDelegate, BarcodeDecoderDelegate, FaceDetectorHelperDelegate>
 
@@ -35,6 +44,12 @@
 // State
 @property (nonatomic, assign) ScanState currentState;
 @property (nonatomic, assign) BOOL isFlashOn;
+@property (nonatomic, assign) BOOL isDismissing;
+
+// Face detection state (front scan)
+@property (nonatomic, assign) BOOL frontFaceDetected;
+@property (nonatomic, assign) BOOL frontCaptureTriggered;
+@property (nonatomic, assign) NSInteger faceCheckCounter;
 
 // Options
 @property (nonatomic, assign) BOOL captureFullImages;
@@ -49,8 +64,9 @@
 @property (nonatomic, strong) NSString *backRawData;
 @property (nonatomic, strong) NSDictionary *parsedFields;
 
-// Timeout timer
+// Timers
 @property (nonatomic, strong) NSTimer *timeoutTimer;
+@property (nonatomic, strong) NSTimer *faceFallbackTimer;
 
 @end
 
@@ -61,6 +77,11 @@
 - (void)viewDidLoad {
     [super viewDidLoad];
 
+    self.isDismissing = NO;
+    self.frontFaceDetected = NO;
+    self.frontCaptureTriggered = NO;
+    self.faceCheckCounter = 0;
+
     [self parseOptions];
     [self setupUI];
     [self initializeManagers];
@@ -68,17 +89,22 @@
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
-    [self transitionToState:ScanStateScanningFront];
+    if (!self.isDismissing) {
+        [self transitionToState:ScanStateScanningFront];
+    }
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
     [super viewWillDisappear:animated];
     [self stopScanning];
-    [self cancelTimeout];
+    [self cancelAllTimers];
 }
 
 - (void)dealloc {
-    [self cancelTimeout];
+    [self cancelAllTimers];
+    _cameraManager = nil;
+    _barcodeDecoder = nil;
+    _faceDetector = nil;
     NSLog(@"[ScannerVC] Deallocated");
 }
 
@@ -143,6 +169,8 @@
     self.overlayView = [[UIView alloc] init];
     self.overlayView.translatesAutoresizingMaskIntoConstraints = NO;
     self.overlayView.backgroundColor = [UIColor clearColor];
+    // Allow touches to pass through to buttons underneath
+    self.overlayView.userInteractionEnabled = NO;
     [self.view addSubview:self.overlayView];
 
     [NSLayoutConstraint activateConstraints:@[
@@ -160,6 +188,8 @@
     self.scanFrame.layer.borderColor = [UIColor whiteColor].CGColor;
     self.scanFrame.layer.borderWidth = 3.0;
     self.scanFrame.layer.cornerRadius = 12.0;
+    // Scan frame doesn't need touch interaction
+    self.scanFrame.userInteractionEnabled = NO;
     [self.view addSubview:self.scanFrame];
 
     // Driver license aspect ratio: 3.375" x 2.125" = 1.586:1
@@ -172,16 +202,12 @@
         [self.scanFrame.heightAnchor constraintEqualToAnchor:self.scanFrame.widthAnchor multiplier:1.0/aspectRatio]
     ]];
 
-    // Add corner indicators
     [self addCornerIndicatorsToFrame];
 }
 
 - (void)addCornerIndicatorsToFrame {
-    CGFloat cornerLength = 40.0;
-    CGFloat cornerWidth = 4.0;
-    UIColor *cornerColor = [UIColor colorWithRed:0 green:0.78 blue:0.33 alpha:1.0]; // Green
+    UIColor *cornerColor = [UIColor colorWithRed:0 green:0.78 blue:0.33 alpha:1.0];
 
-    // Create corner indicators (will be positioned in layoutSubviews)
     NSArray *corners = @[@"topLeft", @"topRight", @"bottomLeft", @"bottomRight"];
 
     for (NSString *corner in corners) {
@@ -208,25 +234,21 @@
     CGFloat cornerWidth = 4.0;
     CGRect bounds = self.scanFrame.bounds;
 
-    // Top-left
     UIView *tlH = [self.scanFrame viewWithTag:100];
     UIView *tlV = [self.scanFrame viewWithTag:101];
     tlH.frame = CGRectMake(0, 0, cornerLength, cornerWidth);
     tlV.frame = CGRectMake(0, 0, cornerWidth, cornerLength);
 
-    // Top-right
     UIView *trH = [self.scanFrame viewWithTag:102];
     UIView *trV = [self.scanFrame viewWithTag:103];
     trH.frame = CGRectMake(bounds.size.width - cornerLength, 0, cornerLength, cornerWidth);
     trV.frame = CGRectMake(bounds.size.width - cornerWidth, 0, cornerWidth, cornerLength);
 
-    // Bottom-left
     UIView *blH = [self.scanFrame viewWithTag:104];
     UIView *blV = [self.scanFrame viewWithTag:105];
     blH.frame = CGRectMake(0, bounds.size.height - cornerWidth, cornerLength, cornerWidth);
     blV.frame = CGRectMake(0, bounds.size.height - cornerLength, cornerWidth, cornerLength);
 
-    // Bottom-right
     UIView *brH = [self.scanFrame viewWithTag:106];
     UIView *brV = [self.scanFrame viewWithTag:107];
     brH.frame = CGRectMake(bounds.size.width - cornerLength, bounds.size.height - cornerWidth, cornerLength, cornerWidth);
@@ -234,7 +256,6 @@
 }
 
 - (void)updateOverlayMask {
-    // Create semi-transparent overlay with cutout for scan frame
     CAShapeLayer *maskLayer = [CAShapeLayer layer];
     UIBezierPath *path = [UIBezierPath bezierPathWithRect:self.overlayView.bounds];
 
@@ -266,6 +287,7 @@
     self.instructionLabel.layer.shadowOffset = CGSizeMake(1, 1);
     self.instructionLabel.layer.shadowOpacity = 0.8;
     self.instructionLabel.layer.shadowRadius = 3;
+    self.instructionLabel.userInteractionEnabled = NO;
     [self.view addSubview:self.instructionLabel];
 
     [NSLayoutConstraint activateConstraints:@[
@@ -278,11 +300,12 @@
 - (void)setupStatusLabel {
     self.statusLabel = [[UILabel alloc] init];
     self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    self.statusLabel.text = @"Align the license within the frame";
+    self.statusLabel.text = @"Looking for license photo...";
     self.statusLabel.textColor = [UIColor colorWithWhite:0.8 alpha:1.0];
     self.statusLabel.font = [UIFont systemFontOfSize:16];
     self.statusLabel.textAlignment = NSTextAlignmentCenter;
     self.statusLabel.numberOfLines = 0;
+    self.statusLabel.userInteractionEnabled = NO;
     [self.view addSubview:self.statusLabel];
 
     [NSLayoutConstraint activateConstraints:@[
@@ -298,6 +321,7 @@
     self.flipInstructionView.backgroundColor = [UIColor colorWithWhite:0 alpha:0.8];
     self.flipInstructionView.layer.cornerRadius = 16;
     self.flipInstructionView.hidden = YES;
+    self.flipInstructionView.userInteractionEnabled = NO;
     [self.view addSubview:self.flipInstructionView];
 
     [NSLayoutConstraint activateConstraints:@[
@@ -307,7 +331,6 @@
         [self.flipInstructionView.heightAnchor constraintEqualToConstant:240]
     ]];
 
-    // Flip icon
     self.flipIconView = [[UIImageView alloc] init];
     self.flipIconView.translatesAutoresizingMaskIntoConstraints = NO;
     self.flipIconView.image = [UIImage systemImageNamed:@"arrow.triangle.2.circlepath"];
@@ -367,8 +390,10 @@
     self.flashButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.flashButton setTitle:@"Flash On" forState:UIControlStateNormal];
     [self.flashButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    self.flashButton.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
+    self.flashButton.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    self.flashButton.backgroundColor = [UIColor colorWithWhite:0.2 alpha:0.8];
     self.flashButton.layer.cornerRadius = 24;
+    self.flashButton.clipsToBounds = YES;
     [self.flashButton addTarget:self action:@selector(toggleFlash) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.flashButton];
 
@@ -377,8 +402,10 @@
     self.cancelButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.cancelButton setTitle:@"Cancel" forState:UIControlStateNormal];
     [self.cancelButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    self.cancelButton.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
+    self.cancelButton.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    self.cancelButton.backgroundColor = [UIColor colorWithRed:0.8 green:0.2 blue:0.2 alpha:0.8];
     self.cancelButton.layer.cornerRadius = 24;
+    self.cancelButton.clipsToBounds = YES;
     [self.cancelButton addTarget:self action:@selector(cancelPressed) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.cancelButton];
 
@@ -393,6 +420,10 @@
         [self.cancelButton.widthAnchor constraintEqualToConstant:120],
         [self.cancelButton.heightAnchor constraintEqualToConstant:48]
     ]];
+
+    // Ensure buttons are always on top
+    [self.view bringSubviewToFront:self.flashButton];
+    [self.view bringSubviewToFront:self.cancelButton];
 }
 
 #pragma mark - Manager Initialization
@@ -412,10 +443,14 @@
 #pragma mark - State Management
 
 - (void)transitionToState:(ScanState)newState {
+    if (self.isDismissing) {
+        return;
+    }
+
     NSLog(@"[ScannerVC] Transitioning from %ld to %ld", (long)self.currentState, (long)newState);
 
     _currentState = newState;
-    [self cancelTimeout];
+    [self cancelAllTimers];
 
     dispatch_async(dispatch_get_main_queue(), ^{
         [self updateUIForState:newState];
@@ -438,23 +473,23 @@
             [self finishWithSuccess];
             break;
         case ScanStateError:
-            // Error handled separately
             break;
     }
 }
 
 - (void)updateUIForState:(ScanState)state {
-    // Reset visibility
     self.activityIndicator.hidden = YES;
     [self.activityIndicator stopAnimating];
     self.flipInstructionView.hidden = YES;
     self.scanFrame.hidden = NO;
     self.overlayView.hidden = NO;
+    self.flashButton.hidden = NO;
+    self.cancelButton.hidden = NO;
 
     switch (state) {
         case ScanStateScanningFront:
             self.instructionLabel.text = @"Position the FRONT of your driver license";
-            self.statusLabel.text = @"Align the license within the frame";
+            self.statusLabel.text = @"Looking for license photo...";
             self.scanFrame.layer.borderColor = [UIColor whiteColor].CGColor;
             break;
 
@@ -469,7 +504,7 @@
 
         case ScanStateScanningBack:
             self.instructionLabel.text = @"Position the BACK of your driver license";
-            self.statusLabel.text = @"Align the barcode within the frame";
+            self.statusLabel.text = @"Scanning barcode...";
             self.scanFrame.layer.borderColor = [UIColor whiteColor].CGColor;
             break;
 
@@ -479,6 +514,8 @@
             [self.activityIndicator startAnimating];
             self.scanFrame.hidden = YES;
             self.overlayView.hidden = YES;
+            self.flashButton.hidden = YES;
+            self.cancelButton.hidden = YES;
             break;
 
         case ScanStateCompleted:
@@ -496,20 +533,40 @@
 #pragma mark - Scan Flow
 
 - (void)startFrontScan {
-    NSLog(@"[ScannerVC] Starting front scan");
-    [self.cameraManager startCameraWithBarcodeScanning:NO];
+    NSLog(@"[ScannerVC] Starting front scan with face detection");
+
+    self.frontFaceDetected = NO;
+    self.frontCaptureTriggered = NO;
+    self.faceCheckCounter = 0;
+
+    // Enable video frames so we can detect faces before capturing
+    [self.cameraManager startCameraWithBarcodeScanning:YES];
+
+    // Overall timeout: fail if front scan takes too long
+    __weak __typeof(self) weakSelf = self;
     [self startTimeoutWithHandler:^{
-        if (self.currentState == ScanStateScanningFront) {
-            [self failWithError:@"SCAN_TIMEOUT" message:@"Front scan timed out. Please try again."];
+        __strong __typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf && strongSelf.currentState == ScanStateScanningFront) {
+            [strongSelf failWithError:@"SCAN_TIMEOUT" message:@"Front scan timed out. Please try again."];
         }
     }];
 
-    // Auto-capture front after short delay for positioning
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (self.currentState == ScanStateScanningFront) {
-            [self.cameraManager captureImage];
+    // Face detection fallback: if no face found after N seconds, capture anyway
+    self.faceFallbackTimer = [NSTimer scheduledTimerWithTimeInterval:kFaceDetectionFallbackTimeout
+                                                             repeats:NO
+                                                               block:^(NSTimer *timer) {
+        __strong __typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf && !strongSelf.isDismissing
+            && strongSelf.currentState == ScanStateScanningFront
+            && !strongSelf.frontCaptureTriggered) {
+            NSLog(@"[ScannerVC] Face fallback: capturing without face detection");
+            strongSelf.frontCaptureTriggered = YES;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                strongSelf.statusLabel.text = @"Capturing...";
+            });
+            [strongSelf.cameraManager captureImage];
         }
-    });
+    }];
 }
 
 - (void)showFlipInstruction {
@@ -526,47 +583,65 @@
     } completion:nil];
 
     // Auto-transition to back scan after delay
+    __weak __typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self.flipIconView.layer removeAllAnimations];
-        self.flipIconView.transform = CGAffineTransformIdentity;
+        __strong __typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.isDismissing) {
+            return;
+        }
 
-        if (self.currentState == ScanStateFlipInstruction) {
-            [self transitionToState:ScanStateScanningBack];
+        [strongSelf.flipIconView.layer removeAllAnimations];
+        strongSelf.flipIconView.transform = CGAffineTransformIdentity;
+
+        if (strongSelf.currentState == ScanStateFlipInstruction) {
+            [strongSelf transitionToState:ScanStateScanningBack];
         }
     });
 }
 
 - (void)startBackScan {
     NSLog(@"[ScannerVC] Starting back scan");
+    [self.barcodeDecoder reset];
     [self.cameraManager startCameraWithBarcodeScanning:YES];
+
+    __weak __typeof(self) weakSelf = self;
     [self startTimeoutWithHandler:^{
-        if (self.currentState == ScanStateScanningBack) {
-            [self failWithError:@"BARCODE_NOT_FOUND" message:@"Could not detect barcode. Please try again."];
+        __strong __typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf && strongSelf.currentState == ScanStateScanningBack) {
+            [strongSelf failWithError:@"BARCODE_NOT_FOUND" message:@"Could not detect barcode. Please try again."];
         }
     }];
 }
 
 - (void)processResults {
     NSLog(@"[ScannerVC] Processing results");
+    [self.cameraManager stopCamera];
 
+    __weak __typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        // Parse AAMVA data
-        if (self.backRawData) {
-            self.parsedFields = [self.aamvaParser parseRawData:self.backRawData];
-        } else {
-            self.parsedFields = @{@"isValid": @NO, @"error": @"No barcode data captured"};
-        }
+        @autoreleasepool {
+            __strong __typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
 
-        // Extract portrait if needed and not already done
-        if (self.extractPortrait && self.frontImage && !self.portraitImage) {
-            self.portraitImage = [ImageUtils extractPortraitDeterministic:self.frontImage];
-        }
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (self.currentState == ScanStateProcessing) {
-                [self transitionToState:ScanStateCompleted];
+            // Parse AAMVA data
+            if (strongSelf.backRawData) {
+                strongSelf.parsedFields = [strongSelf.aamvaParser parseRawData:strongSelf.backRawData];
+            } else {
+                strongSelf.parsedFields = @{@"isValid": @NO, @"error": @"No barcode data captured"};
             }
-        });
+
+            // Extract portrait if needed and not already done
+            if (strongSelf.extractPortrait && strongSelf.frontImage && !strongSelf.portraitImage) {
+                strongSelf.portraitImage = [ImageUtils extractPortraitDeterministic:strongSelf.frontImage];
+            }
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+                __strong __typeof(weakSelf) strongSelf2 = weakSelf;
+                if (strongSelf2 && strongSelf2.currentState == ScanStateProcessing) {
+                    [strongSelf2 transitionToState:ScanStateCompleted];
+                }
+            });
+        }
     });
 }
 
@@ -577,14 +652,12 @@
     result[@"backRawData"] = self.backRawData ?: [NSNull null];
     result[@"parsedFields"] = self.parsedFields ?: @{};
 
-    // Portrait image
     if (self.portraitImage) {
         result[@"portraitImageBase64"] = [ImageUtils imageToBase64:self.portraitImage format:@"JPEG" quality:85];
     } else {
         result[@"portraitImageBase64"] = @"";
     }
 
-    // Full images
     if (self.captureFullImages) {
         if (self.frontImage) {
             result[@"fullFrontImageBase64"] = [ImageUtils imageToBase64:self.frontImage format:@"JPEG" quality:85];
@@ -594,54 +667,119 @@
         }
     }
 
+    self.frontImage = nil;
+    self.backImage = nil;
+    self.portraitImage = nil;
+
     [self.delegate scannerViewController:self didFinishWithResult:result];
 }
 
 - (void)failWithError:(NSString *)errorCode message:(NSString *)message {
+    if (self.isDismissing) {
+        return;
+    }
+
     _currentState = ScanStateError;
     [self stopScanning];
+
+    self.frontImage = nil;
+    self.backImage = nil;
+    self.portraitImage = nil;
+
     [self.delegate scannerViewController:self didFailWithError:errorCode message:message];
 }
 
 - (void)stopScanning {
     [self.cameraManager stopCamera];
-    [self cancelTimeout];
+    [self cancelAllTimers];
+}
+
+#pragma mark - Face Detection on Video Frames
+
+- (void)checkForFaceInSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+    // Throttle: check every Nth frame
+    self.faceCheckCounter++;
+    if (self.faceCheckCounter % kFaceCheckInterval != 0) {
+        return;
+    }
+
+    CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (!pixelBuffer) {
+        return;
+    }
+
+    // Run Vision face detection synchronously (fast for rectangles only)
+    VNDetectFaceRectanglesRequest *request = [[VNDetectFaceRectanglesRequest alloc] init];
+    VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pixelBuffer
+                                                                              orientation:kCGImagePropertyOrientationRight
+                                                                                  options:@{}];
+
+    NSError *error = nil;
+    [handler performRequests:@[request] error:&error];
+
+    if (error) {
+        return;
+    }
+
+    if (request.results.count > 0) {
+        NSLog(@"[ScannerVC] Face detected in video frame (%lu face(s))", (unsigned long)request.results.count);
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (self.isDismissing || self.currentState != ScanStateScanningFront || self.frontCaptureTriggered) {
+                return;
+            }
+
+            self.frontFaceDetected = YES;
+            self.frontCaptureTriggered = YES;
+
+            // Visual feedback
+            self.statusLabel.text = @"Face detected! Capturing...";
+            self.scanFrame.layer.borderColor = [UIColor colorWithRed:0 green:0.78 blue:0.33 alpha:1.0].CGColor;
+
+            // Capture the front image
+            [self.cameraManager captureImage];
+        });
+    }
 }
 
 #pragma mark - Button Actions
 
 - (void)toggleFlash {
+    NSLog(@"[ScannerVC] Flash toggled");
     self.isFlashOn = !self.isFlashOn;
     [self.cameraManager setFlash:self.isFlashOn];
     [self.flashButton setTitle:self.isFlashOn ? @"Flash Off" : @"Flash On" forState:UIControlStateNormal];
 }
 
 - (void)cancelPressed {
+    NSLog(@"[ScannerVC] Cancel pressed");
+    self.isDismissing = YES;
     [self stopScanning];
     [self.delegate scannerViewControllerDidCancel:self];
 }
 
-#pragma mark - Timeout Management
+#pragma mark - Timer Management
 
 - (void)startTimeoutWithHandler:(void (^)(void))handler {
-    [self cancelTimeout];
-    self.timeoutTimer = [NSTimer scheduledTimerWithTimeInterval:self.scanTimeout
-                                                         target:self
-                                                       selector:@selector(timeoutFired:)
-                                                       userInfo:handler
-                                                        repeats:NO];
-}
-
-- (void)timeoutFired:(NSTimer *)timer {
-    void (^handler)(void) = timer.userInfo;
-    if (handler) {
-        handler();
-    }
-}
-
-- (void)cancelTimeout {
     [self.timeoutTimer invalidate];
     self.timeoutTimer = nil;
+
+    __weak __typeof(self) weakSelf = self;
+    self.timeoutTimer = [NSTimer scheduledTimerWithTimeInterval:self.scanTimeout
+                                                        repeats:NO
+                                                          block:^(NSTimer *timer) {
+        __strong __typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf && !strongSelf.isDismissing && handler) {
+            handler();
+        }
+    }];
+}
+
+- (void)cancelAllTimers {
+    [self.timeoutTimer invalidate];
+    self.timeoutTimer = nil;
+    [self.faceFallbackTimer invalidate];
+    self.faceFallbackTimer = nil;
 }
 
 #pragma mark - CameraManagerDelegate
@@ -652,6 +790,7 @@
     if (self.currentState == ScanStateScanningFront) {
         self.frontImage = image;
 
+        // Extract portrait from the captured image
         if (self.extractPortrait) {
             [self.faceDetector detectFaceInImage:image];
         } else {
@@ -663,7 +802,13 @@
 }
 
 - (void)cameraManager:(CameraManager *)manager didReceiveSampleBuffer:(CMSampleBufferRef)sampleBuffer {
-    if (self.currentState == ScanStateScanningBack) {
+    // Called on the video queue — must be thread-safe
+
+    if (self.currentState == ScanStateScanningFront && !self.frontCaptureTriggered) {
+        // Front scan: detect face in video frames
+        [self checkForFaceInSampleBuffer:sampleBuffer];
+    } else if (self.currentState == ScanStateScanningBack) {
+        // Back scan: decode barcode
         [self.barcodeDecoder decodeSampleBuffer:sampleBuffer];
     }
 }
@@ -673,53 +818,127 @@
     [self failWithError:@"CAMERA_NOT_AVAILABLE" message:error.localizedDescription];
 }
 
+// Native AVFoundation PDF417 detection (primary detector, much more reliable than ZXingObjC)
+- (void)cameraManager:(CameraManager *)manager didDetectBarcodeData:(NSString *)data {
+    NSLog(@"[ScannerVC] *** Native PDF417 data received, length=%lu", (unsigned long)data.length);
+
+    if (self.isDismissing || self.currentState != ScanStateScanningBack) {
+        return;
+    }
+
+    // Guard: already captured barcode data
+    if (self.backRawData) {
+        return;
+    }
+
+    // Validate AAMVA format
+    if ([self isValidAAMVAData:data]) {
+        NSLog(@"[ScannerVC] Native PDF417 passed AAMVA validation — processing");
+        [self handleBarcodeDetected:data];
+    } else {
+        NSLog(@"[ScannerVC] Native PDF417 detected but failed AAMVA validation");
+    }
+}
+
+#pragma mark - Shared Barcode Handling
+
+// Shared handler for barcode data from either native detection or ZXingObjC
+- (void)handleBarcodeDetected:(NSString *)rawData {
+    // Thread safety: this should always be called on the main queue
+    // Guard against double fire (both native and ZXingObjC could detect simultaneously)
+    if (self.backRawData) {
+        NSLog(@"[ScannerVC] handleBarcodeDetected: already have data, ignoring duplicate");
+        return;
+    }
+
+    NSLog(@"[ScannerVC] *** BARCODE CAPTURED *** length=%lu", (unsigned long)rawData.length);
+    self.backRawData = rawData;
+
+    // Update UI to show success
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.statusLabel.text = @"Barcode found!";
+        self.scanFrame.layer.borderColor = [UIColor colorWithRed:0 green:0.78 blue:0.33 alpha:1.0].CGColor;
+    });
+
+    if (self.enableVibration) {
+        AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
+    }
+
+    // Capture back image
+    [self.cameraManager captureImage];
+
+    // Short delay then process
+    __weak __typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong __typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf && !strongSelf.isDismissing && strongSelf.currentState == ScanStateScanningBack) {
+            [strongSelf transitionToState:ScanStateProcessing];
+        }
+    });
+}
+
+// AAMVA validation for native detection path (same logic as BarcodeDecoder)
+- (BOOL)isValidAAMVAData:(NSString *)data {
+    if (!data || data.length < 20) {
+        return NO;
+    }
+
+    BOOL hasStartMarker = [data hasPrefix:@"@"] ||
+                          [data containsString:@"@\n"] ||
+                          [data containsString:@"@\r"];
+
+    BOOL hasANSIMarker = [data containsString:@"ANSI"];
+
+    // Check for common AAMVA field codes
+    BOOL hasFieldCodes = [data containsString:@"DAQ"] ||  // License number
+                         [data containsString:@"DCS"] ||  // Last name
+                         [data containsString:@"DAC"] ||  // First name
+                         [data containsString:@"DBB"];    // Date of birth
+
+    // Accept if it has field codes AND either a start marker or ANSI identifier
+    return (hasStartMarker || hasANSIMarker) && hasFieldCodes;
+}
+
 #pragma mark - BarcodeDecoderDelegate
 
 - (void)barcodeDecoder:(BarcodeDecoder *)decoder didDecodeBarcode:(NSString *)rawData {
-    NSLog(@"[ScannerVC] Barcode decoded, length=%lu", (unsigned long)rawData.length);
+    NSLog(@"[ScannerVC] ZXingObjC barcode decoded, length=%lu", (unsigned long)rawData.length);
 
-    if (self.currentState == ScanStateScanningBack && rawData.length > 0) {
-        self.backRawData = rawData;
-
-        if (self.enableVibration) {
-            AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
-        }
-
-        // Capture back image
-        [self.cameraManager captureImage];
-
-        // Short delay then process
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (self.currentState == ScanStateScanningBack) {
-                [self transitionToState:ScanStateProcessing];
-            }
-        });
+    if (self.isDismissing || self.currentState != ScanStateScanningBack || rawData.length == 0) {
+        return;
     }
+
+    // Guard: native detector may have already captured data
+    if (self.backRawData) {
+        NSLog(@"[ScannerVC] ZXingObjC result ignored — native detector already captured data");
+        return;
+    }
+
+    [self handleBarcodeDetected:rawData];
 }
 
 - (void)barcodeDecoder:(BarcodeDecoder *)decoder didFailWithError:(NSError *)error {
     // Ignore decoding errors during continuous scanning
-    // NSLog(@"[ScannerVC] Barcode decode error: %@", error);
 }
 
 #pragma mark - FaceDetectorHelperDelegate
 
 - (void)faceDetectorHelper:(FaceDetectorHelper *)helper didDetectFace:(UIImage *)croppedFace {
-    NSLog(@"[ScannerVC] Face detected and cropped");
+    NSLog(@"[ScannerVC] Face detected and cropped from captured photo");
     self.portraitImage = croppedFace;
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (self.currentState == ScanStateScanningFront) {
+        if (!self.isDismissing && self.currentState == ScanStateScanningFront) {
             [self transitionToState:ScanStateFlipInstruction];
         }
     });
 }
 
 - (void)faceDetectorHelperDidNotDetectFace:(FaceDetectorHelper *)helper {
-    NSLog(@"[ScannerVC] No face detected, will use deterministic crop");
+    NSLog(@"[ScannerVC] No face in captured photo, using deterministic crop");
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (self.currentState == ScanStateScanningFront) {
+        if (!self.isDismissing && self.currentState == ScanStateScanningFront) {
             [self transitionToState:ScanStateFlipInstruction];
         }
     });
@@ -729,7 +948,7 @@
     NSLog(@"[ScannerVC] Face detection error: %@", error);
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (self.currentState == ScanStateScanningFront) {
+        if (!self.isDismissing && self.currentState == ScanStateScanningFront) {
             [self transitionToState:ScanStateFlipInstruction];
         }
     });

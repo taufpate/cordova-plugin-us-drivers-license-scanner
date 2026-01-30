@@ -2,6 +2,8 @@
  * BarcodeDecoder.m
  *
  * PDF417 barcode decoder implementation using ZXingObjC.
+ * Fixed: CGImage is extracted on the calling thread (video queue) while the
+ * CMSampleBufferRef is still valid, then dispatched to the decode queue.
  */
 
 #import "BarcodeDecoder.h"
@@ -10,9 +12,13 @@
 // Debounce interval to avoid reporting same barcode repeatedly
 static NSTimeInterval const kDebounceInterval = 1.0;
 
+// Maximum dimension for barcode analysis (smaller = less memory, still enough for PDF417)
+static CGFloat const kMaxAnalysisDimension = 720.0;
+
 @interface BarcodeDecoder ()
 
 @property (nonatomic, strong) ZXMultiFormatReader *reader;
+@property (nonatomic, strong) ZXDecodeHints *decodeHints;
 @property (nonatomic, strong) dispatch_queue_t decodeQueue;
 @property (nonatomic, assign) BOOL isProcessing;
 @property (nonatomic, strong) NSString *lastDecodedData;
@@ -36,21 +42,17 @@ static NSTimeInterval const kDebounceInterval = 1.0;
 }
 
 - (void)setupReader {
-    // Configure hints for PDF417 decoding
-    ZXDecodeHints *hints = [ZXDecodeHints hints];
+    // Configure hints once and reuse (avoid per-frame allocation)
+    self.decodeHints = [ZXDecodeHints hints];
 
     // Primary format: PDF417 (used by driver licenses)
-    [hints addPossibleFormat:kBarcodeFormatPDF417];
-
-    // Fallback formats
-    [hints addPossibleFormat:kBarcodeFormatDataMatrix];
-    [hints addPossibleFormat:kBarcodeFormatQRCode];
+    [self.decodeHints addPossibleFormat:kBarcodeFormatPDF417];
 
     // Enable harder decoding for damaged/blurry barcodes
-    hints.tryHarder = YES;
+    self.decodeHints.tryHarder = YES;
 
     // Use ISO-8859-1 character set (common for AAMVA data)
-    hints.encoding = NSISOLatin1StringEncoding;
+    self.decodeHints.encoding = NSISOLatin1StringEncoding;
 
     self.reader = [ZXMultiFormatReader reader];
 
@@ -60,20 +62,26 @@ static NSTimeInterval const kDebounceInterval = 1.0;
 #pragma mark - Public Methods
 
 - (void)decodeSampleBuffer:(CMSampleBufferRef)sampleBuffer {
-    // Skip if already processing
+    // Skip if already processing a frame
     if (self.isProcessing) {
+        return;
+    }
+
+    // CRITICAL: Extract CGImage NOW on the calling thread (video queue)
+    // while the CMSampleBufferRef is still valid. The buffer may be recycled
+    // by AVFoundation before a dispatched block runs on the decode queue.
+    CGImageRef cgImage = [self extractCGImageFromBuffer:sampleBuffer];
+    if (!cgImage) {
         return;
     }
 
     self.isProcessing = YES;
 
-    // Convert sample buffer to image on decode queue
+    // Dispatch the independent CGImage copy to the decode queue
     dispatch_async(self.decodeQueue, ^{
         @autoreleasepool {
-            UIImage *image = [self imageFromSampleBuffer:sampleBuffer];
-            if (image) {
-                [self processImage:image];
-            }
+            [self decodeCGImageAndReport:cgImage];
+            CGImageRelease(cgImage);
             self.isProcessing = NO;
         }
     });
@@ -88,7 +96,9 @@ static NSTimeInterval const kDebounceInterval = 1.0;
 
     dispatch_async(self.decodeQueue, ^{
         @autoreleasepool {
-            [self processImage:image];
+            // Scale down before processing
+            UIImage *scaled = [self scaleImageForAnalysis:image];
+            [self processImage:scaled];
             self.isProcessing = NO;
         }
     });
@@ -97,23 +107,30 @@ static NSTimeInterval const kDebounceInterval = 1.0;
 - (void)reset {
     self.lastDecodedData = nil;
     self.lastDecodeTime = nil;
+    self.isProcessing = NO;
 }
 
-#pragma mark - Image Processing
+#pragma mark - Buffer → CGImage Extraction (called on video queue)
 
-- (UIImage *)imageFromSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+- (CGImageRef)extractCGImageFromBuffer:(CMSampleBufferRef)sampleBuffer {
     CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!imageBuffer) {
-        return nil;
+        return NULL;
     }
 
     CVPixelBufferLockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
 
-    void *baseAddress = CVPixelBufferGetBaseAddress(imageBuffer);
-    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(imageBuffer);
     size_t width = CVPixelBufferGetWidth(imageBuffer);
     size_t height = CVPixelBufferGetHeight(imageBuffer);
+    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(imageBuffer);
+    void *baseAddress = CVPixelBufferGetBaseAddress(imageBuffer);
 
+    if (!baseAddress) {
+        CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+        return NULL;
+    }
+
+    // Create CGImage directly from pixel buffer data
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
     CGContextRef context = CGBitmapContextCreate(
         baseAddress,
@@ -125,42 +142,92 @@ static NSTimeInterval const kDebounceInterval = 1.0;
         kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst
     );
 
+    // CGBitmapContextCreateImage makes an independent copy of the pixel data
     CGImageRef cgImage = CGBitmapContextCreateImage(context);
 
+    // Release buffer lock immediately — cgImage has its own copy
     CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
     CGContextRelease(context);
     CGColorSpaceRelease(colorSpace);
 
+    return cgImage; // Caller must CGImageRelease
+}
+
+#pragma mark - Decode CGImage (called on decode queue)
+
+- (void)decodeCGImageAndReport:(CGImageRef)cgImage {
     if (!cgImage) {
-        return nil;
+        return;
     }
 
-    UIImage *image = [UIImage imageWithCGImage:cgImage];
-    CGImageRelease(cgImage);
+    size_t imgW = CGImageGetWidth(cgImage);
+    size_t imgH = CGImageGetHeight(cgImage);
+    NSLog(@"[BarcodeDecoder] Analyzing frame %zux%zu", imgW, imgH);
 
-    return image;
+    // Try original orientation
+    NSString *result = [self decodeFromCGImage:cgImage];
+
+    // Try 90-degree rotation if original fails (portrait vs landscape mismatch)
+    if (!result) {
+        CGImageRef rotated90 = [self createRotatedCGImage:cgImage degrees:90];
+        if (rotated90) {
+            result = [self decodeFromCGImage:rotated90];
+            CGImageRelease(rotated90);
+        }
+    }
+
+    // Try 270-degree rotation as last resort
+    if (!result) {
+        CGImageRef rotated270 = [self createRotatedCGImage:cgImage degrees:270];
+        if (rotated270) {
+            result = [self decodeFromCGImage:rotated270];
+            CGImageRelease(rotated270);
+        }
+    }
+
+    if (result) {
+        NSLog(@"[BarcodeDecoder] ZXing decoded data length=%lu, first 60: %@",
+              (unsigned long)result.length,
+              [result substringToIndex:MIN(60, result.length)]);
+
+        if ([self isValidAAMVAData:result]) {
+            NSLog(@"[BarcodeDecoder] AAMVA validation passed");
+            [self handleDecodedData:result];
+        } else {
+            NSLog(@"[BarcodeDecoder] AAMVA validation FAILED for decoded data");
+        }
+    }
+}
+
+#pragma mark - Image Processing
+
+- (UIImage *)scaleImageForAnalysis:(UIImage *)image {
+    CGFloat width = image.size.width;
+    CGFloat height = image.size.height;
+
+    if (width <= kMaxAnalysisDimension && height <= kMaxAnalysisDimension) {
+        return image;
+    }
+
+    CGFloat scale = MIN(kMaxAnalysisDimension / width, kMaxAnalysisDimension / height);
+    CGSize newSize = CGSizeMake(width * scale, height * scale);
+
+    UIGraphicsBeginImageContextWithOptions(newSize, YES, 1.0);
+    [image drawInRect:CGRectMake(0, 0, newSize.width, newSize.height)];
+    UIImage *scaledImage = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+
+    return scaledImage;
 }
 
 - (void)processImage:(UIImage *)image {
     // Try original orientation
     NSString *result = [self decodeFromImage:image];
 
+    // Only try 90-degree rotation (covers the most common alternative orientation)
     if (!result) {
-        // Try rotated 90 degrees
         UIImage *rotated90 = [self rotateImage:image byDegrees:90];
         result = [self decodeFromImage:rotated90];
-    }
-
-    if (!result) {
-        // Try rotated 180 degrees
-        UIImage *rotated180 = [self rotateImage:image byDegrees:180];
-        result = [self decodeFromImage:rotated180];
-    }
-
-    if (!result) {
-        // Try rotated 270 degrees
-        UIImage *rotated270 = [self rotateImage:image byDegrees:270];
-        result = [self decodeFromImage:rotated270];
     }
 
     if (result && [self isValidAAMVAData:result]) {
@@ -168,37 +235,82 @@ static NSTimeInterval const kDebounceInterval = 1.0;
     }
 }
 
-- (NSString *)decodeFromImage:(UIImage *)image {
-    if (!image) {
+- (NSString *)decodeFromCGImage:(CGImageRef)cgImage {
+    if (!cgImage) {
         return nil;
     }
 
     @try {
-        CGImageRef cgImage = image.CGImage;
-        if (!cgImage) {
-            return nil;
-        }
-
         ZXCGImageLuminanceSource *source = [[ZXCGImageLuminanceSource alloc] initWithCGImage:cgImage];
         ZXHybridBinarizer *binarizer = [[ZXHybridBinarizer alloc] initWithSource:source];
         ZXBinaryBitmap *bitmap = [[ZXBinaryBitmap alloc] initWithBinarizer:binarizer];
 
-        ZXDecodeHints *hints = [ZXDecodeHints hints];
-        [hints addPossibleFormat:kBarcodeFormatPDF417];
-        hints.tryHarder = YES;
-
         NSError *error = nil;
-        ZXResult *zxResult = [self.reader decode:bitmap hints:hints error:&error];
+        ZXResult *zxResult = [self.reader decode:bitmap hints:self.decodeHints error:&error];
 
         if (zxResult && zxResult.text) {
             return zxResult.text;
         }
 
     } @catch (NSException *exception) {
-        NSLog(@"[BarcodeDecoder] Exception during decode: %@", exception);
+        // Decode exceptions are expected for non-barcode frames
     }
 
     return nil;
+}
+
+- (NSString *)decodeFromImage:(UIImage *)image {
+    if (!image) {
+        return nil;
+    }
+
+    CGImageRef cgImage = image.CGImage;
+    if (!cgImage) {
+        return nil;
+    }
+
+    return [self decodeFromCGImage:cgImage];
+}
+
+#pragma mark - CGImage Rotation
+
+- (CGImageRef)createRotatedCGImage:(CGImageRef)source degrees:(CGFloat)degrees {
+    if (!source) {
+        return NULL;
+    }
+
+    CGFloat radians = degrees * M_PI / 180.0;
+    size_t width = CGImageGetWidth(source);
+    size_t height = CGImageGetHeight(source);
+
+    // For 90/270 degree rotation, swap width and height
+    size_t newWidth = height;
+    size_t newHeight = width;
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(
+        NULL,
+        newWidth,
+        newHeight,
+        8,
+        newWidth * 4,
+        colorSpace,
+        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst
+    );
+    CGColorSpaceRelease(colorSpace);
+
+    if (!context) {
+        return NULL;
+    }
+
+    CGContextTranslateCTM(context, newWidth / 2.0, newHeight / 2.0);
+    CGContextRotateCTM(context, radians);
+    CGContextDrawImage(context, CGRectMake(-width / 2.0, -height / 2.0, width, height), source);
+
+    CGImageRef rotated = CGBitmapContextCreateImage(context);
+    CGContextRelease(context);
+
+    return rotated; // Caller must CGImageRelease
 }
 
 #pragma mark - Result Handling
@@ -246,38 +358,22 @@ static NSTimeInterval const kDebounceInterval = 1.0;
     return (hasStartMarker || hasANSIMarker) && hasFieldCodes;
 }
 
-#pragma mark - Image Rotation
+#pragma mark - Legacy Image Rotation (for decodeImage: path)
 
 - (UIImage *)rotateImage:(UIImage *)image byDegrees:(CGFloat)degrees {
     if (!image) {
         return nil;
     }
 
-    CGFloat radians = degrees * M_PI / 180.0;
+    CGImageRef rotated = [self createRotatedCGImage:image.CGImage degrees:degrees];
+    if (!rotated) {
+        return nil;
+    }
 
-    // Calculate new size
-    CGRect rect = CGRectMake(0, 0, image.size.width, image.size.height);
-    CGAffineTransform transform = CGAffineTransformMakeRotation(radians);
-    CGRect rotatedRect = CGRectApplyAffineTransform(rect, transform);
+    UIImage *result = [UIImage imageWithCGImage:rotated];
+    CGImageRelease(rotated);
 
-    // Create rotated context
-    UIGraphicsBeginImageContextWithOptions(rotatedRect.size, NO, image.scale);
-    CGContextRef context = UIGraphicsGetCurrentContext();
-
-    // Move origin to center
-    CGContextTranslateCTM(context, rotatedRect.size.width / 2, rotatedRect.size.height / 2);
-
-    // Rotate
-    CGContextRotateCTM(context, radians);
-
-    // Draw image
-    [image drawInRect:CGRectMake(-image.size.width / 2, -image.size.height / 2,
-                                  image.size.width, image.size.height)];
-
-    UIImage *rotatedImage = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
-
-    return rotatedImage;
+    return result;
 }
 
 @end

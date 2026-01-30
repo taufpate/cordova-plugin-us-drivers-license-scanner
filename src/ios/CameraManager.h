@@ -42,6 +42,17 @@ NS_ASSUME_NONNULL_BEGIN
  */
 - (void)cameraManager:(CameraManager *)manager didFailWithError:(NSError *)error;
 
+@optional
+
+/**
+ * Called when a barcode is detected via native AVFoundation metadata output.
+ * This is more reliable than ZXingObjC for PDF417 on iOS.
+ *
+ * @param manager The camera manager
+ * @param data The decoded barcode string data
+ */
+- (void)cameraManager:(CameraManager *)manager didDetectBarcodeData:(NSString *)data;
+
 @end
 
 /**
