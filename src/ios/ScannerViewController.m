@@ -785,19 +785,29 @@ static NSTimeInterval const kFaceDetectionFallbackTimeout = 10.0;
 #pragma mark - CameraManagerDelegate
 
 - (void)cameraManager:(CameraManager *)manager didCaptureImage:(UIImage *)image {
-    NSLog(@"[ScannerVC] Image captured, state=%ld", (long)self.currentState);
+    NSLog(@"[ScannerVC] Image captured, state=%ld, orientation=%ld, size=%@",
+          (long)self.currentState, (long)image.imageOrientation,
+          NSStringFromCGSize(image.size));
 
     if (self.currentState == ScanStateScanningFront) {
-        self.frontImage = image;
+        // Normalize orientation so face detection and portrait cropping work correctly.
+        // Camera photos have imageOrientation != Up (typically Right for portrait),
+        // which causes coordinate mismatches between Vision bounding boxes
+        // (relative to raw CGImage pixels) and crop rects (computed from UIImage.size).
+        self.frontImage = [ImageUtils normalizeOrientation:image];
+        NSLog(@"[ScannerVC] Front image normalized: size=%@, CGImage=%zux%zu",
+              NSStringFromCGSize(self.frontImage.size),
+              CGImageGetWidth(self.frontImage.CGImage),
+              CGImageGetHeight(self.frontImage.CGImage));
 
         // Extract portrait from the captured image
         if (self.extractPortrait) {
-            [self.faceDetector detectFaceInImage:image];
+            [self.faceDetector detectFaceInImage:self.frontImage];
         } else {
             [self transitionToState:ScanStateFlipInstruction];
         }
     } else if (self.currentState == ScanStateScanningBack) {
-        self.backImage = image;
+        self.backImage = [ImageUtils normalizeOrientation:image];
     }
 }
 

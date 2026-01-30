@@ -92,6 +92,40 @@ static NSInteger const kDefaultQuality = 85;
     return scaledImage;
 }
 
+#pragma mark - Orientation Normalization
+
++ (UIImage *)normalizeOrientation:(UIImage *)image {
+    if (!image) {
+        return nil;
+    }
+
+    // If orientation is already Up, the CGImage pixels are in display orientation
+    if (image.imageOrientation == UIImageOrientationUp) {
+        return image;
+    }
+
+    NSLog(@"[ImageUtils] Normalizing orientation from %ld, size=%@",
+          (long)image.imageOrientation, NSStringFromCGSize(image.size));
+
+    // Draw into a new context to apply the orientation transform.
+    // UIKit's drawInRect: automatically applies the imageOrientation rotation,
+    // producing a new image with pixels in the correct display orientation.
+    UIGraphicsBeginImageContextWithOptions(image.size, NO, image.scale);
+    [image drawInRect:CGRectMake(0, 0, image.size.width, image.size.height)];
+    UIImage *normalizedImage = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+
+    if (normalizedImage) {
+        NSLog(@"[ImageUtils] Normalized to size=%@, CGImage=%zux%zu",
+              NSStringFromCGSize(normalizedImage.size),
+              CGImageGetWidth(normalizedImage.CGImage),
+              CGImageGetHeight(normalizedImage.CGImage));
+        return normalizedImage;
+    }
+
+    return image;
+}
+
 #pragma mark - Portrait Extraction
 
 + (UIImage *)extractPortraitDeterministic:(UIImage *)licenseImage {
@@ -100,26 +134,37 @@ static NSInteger const kDefaultQuality = 85;
         return nil;
     }
 
-    CGFloat width = licenseImage.size.width;
-    CGFloat height = licenseImage.size.height;
+    // Normalize orientation so CGImage pixels match display coordinates
+    UIImage *normalized = [self normalizeOrientation:licenseImage];
 
-    // Determine orientation
+    // First crop to license aspect ratio to isolate the license region.
+    // The full camera image is larger than the license; cropping centers on
+    // the license area so the face-position percentages below are meaningful.
+    UIImage *licenseCropped = [self cropToLicenseAspectRatio:normalized];
+
+    CGFloat width = licenseCropped.size.width;
+    CGFloat height = licenseCropped.size.height;
+
+    // After aspect-ratio crop, determine if the license region is landscape
     BOOL isLandscape = width > height;
+
+    NSLog(@"[ImageUtils] Deterministic portrait extraction: license crop=%@, isLandscape=%d",
+          NSStringFromCGSize(licenseCropped.size), isLandscape);
 
     CGFloat portraitX, portraitY, portraitWidth, portraitHeight;
 
     if (isLandscape) {
         // Standard horizontal license orientation
-        // Portrait typically in left 30%, upper 60%
-        portraitX = width * 0.03;      // 3% from left
-        portraitY = height * 0.12;     // 12% from top
-        portraitWidth = width * 0.26;  // 26% of width
+        // Portrait photo is typically on the left side, vertically centered
+        portraitX = width * 0.03;       // 3% from left
+        portraitY = height * 0.12;      // 12% from top
+        portraitWidth = width * 0.26;   // 26% of width
         portraitHeight = height * 0.55; // 55% of height
     } else {
-        // Vertical orientation
-        portraitX = width * 0.10;      // 10% from left
-        portraitY = height * 0.05;     // 5% from top
-        portraitWidth = width * 0.35;  // 35% of width
+        // Vertical orientation (less common)
+        portraitX = width * 0.10;       // 10% from left
+        portraitY = height * 0.05;      // 5% from top
+        portraitWidth = width * 0.35;   // 35% of width
         portraitHeight = height * 0.30; // 30% of height
     }
 
@@ -136,15 +181,18 @@ static NSInteger const kDefaultQuality = 85;
 
     CGRect cropRect = CGRectMake(portraitX, portraitY, portraitWidth, portraitHeight);
 
-    CGImageRef croppedCGImage = CGImageCreateWithImageInRect(licenseImage.CGImage, cropRect);
+    NSLog(@"[ImageUtils] Portrait crop rect: x=%.0f y=%.0f w=%.0f h=%.0f",
+          cropRect.origin.x, cropRect.origin.y, cropRect.size.width, cropRect.size.height);
+
+    CGImageRef croppedCGImage = CGImageCreateWithImageInRect(licenseCropped.CGImage, cropRect);
     if (!croppedCGImage) {
-        NSLog(@"[ImageUtils] Failed to crop image");
+        NSLog(@"[ImageUtils] Failed to crop portrait image");
         return nil;
     }
 
     UIImage *croppedImage = [UIImage imageWithCGImage:croppedCGImage
-                                                scale:licenseImage.scale
-                                          orientation:licenseImage.imageOrientation];
+                                                scale:licenseCropped.scale
+                                          orientation:UIImageOrientationUp];
     CGImageRelease(croppedCGImage);
 
     return croppedImage;

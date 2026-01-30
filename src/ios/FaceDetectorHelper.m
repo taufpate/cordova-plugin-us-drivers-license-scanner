@@ -2,19 +2,22 @@
  * FaceDetectorHelper.m
  *
  * Vision framework face detection implementation for portrait extraction.
+ * Detects face on a driver license photo and crops it with padding.
  */
 
 #import "FaceDetectorHelper.h"
 #import <Vision/Vision.h>
 
-// Padding factor to add around detected face
-static CGFloat const kFacePaddingFactor = 0.3;
+// Padding factor around detected face for the crop
+static CGFloat const kFacePaddingFactor = 0.35;
 
-// Minimum face size relative to image
-static CGFloat const kMinFaceSizeRatio = 0.05;
+// Minimum face area relative to image area.
+// A face on a license held at scanning distance is typically 0.3-1% of the full
+// camera frame, so we set a low threshold to avoid rejecting real license faces.
+static CGFloat const kMinFaceSizeRatio = 0.002;
 
-// Maximum face size relative to image
-static CGFloat const kMaxFaceSizeRatio = 0.7;
+// Maximum face area relative to image area
+static CGFloat const kMaxFaceSizeRatio = 0.70;
 
 @interface FaceDetectorHelper ()
 
@@ -48,32 +51,68 @@ static CGFloat const kMaxFaceSizeRatio = 0.7;
     });
 }
 
+#pragma mark - Orientation Normalization
+
+- (UIImage *)normalizeImageOrientation:(UIImage *)image {
+    if (image.imageOrientation == UIImageOrientationUp) {
+        return image;
+    }
+
+    // Draw into a new context to apply the orientation transform.
+    // This creates a new CGImage with pixels in the correct display orientation,
+    // so CGImage dimensions match UIImage.size and Vision bounding boxes align
+    // with the pixel data used by CGImageCreateWithImageInRect.
+    UIGraphicsBeginImageContextWithOptions(image.size, NO, image.scale);
+    [image drawInRect:CGRectMake(0, 0, image.size.width, image.size.height)];
+    UIImage *normalized = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+
+    NSLog(@"[FaceDetector] Normalized image orientation from %ld to Up",
+          (long)image.imageOrientation);
+
+    return normalized ?: image;
+}
+
 #pragma mark - Face Detection
 
 - (void)performFaceDetection:(UIImage *)image {
-    // Get CGImage from UIImage
-    CGImageRef cgImage = image.CGImage;
+    // Normalize orientation so CGImage pixels match UIImage display coordinates.
+    // Without this, Vision bounding boxes (relative to raw CGImage) don't match
+    // the crop coordinates (computed from UIImage.size), causing wrong region extraction.
+    UIImage *normalizedImage = [self normalizeImageOrientation:image];
+
+    CGImageRef cgImage = normalizedImage.CGImage;
     if (!cgImage) {
         NSLog(@"[FaceDetector] Could not get CGImage from UIImage");
         [self notifyNoFaceDetected];
         return;
     }
 
+    size_t cgWidth = CGImageGetWidth(cgImage);
+    size_t cgHeight = CGImageGetHeight(cgImage);
+
+    NSLog(@"[FaceDetector] Analyzing image: UIImage size=%@, CGImage=%zux%zu, orientation=%ld",
+          NSStringFromCGSize(normalizedImage.size), cgWidth, cgHeight,
+          (long)normalizedImage.imageOrientation);
+
     // Create face detection request
-    VNDetectFaceRectanglesRequest *request = [[VNDetectFaceRectanglesRequest alloc] initWithCompletionHandler:^(VNRequest *request, NSError *error) {
-        if (error) {
-            NSLog(@"[FaceDetector] Detection error: %@", error);
-            [self notifyError:error];
-            return;
-        }
+    VNDetectFaceRectanglesRequest *request = [[VNDetectFaceRectanglesRequest alloc]
+        initWithCompletionHandler:^(VNRequest *request, NSError *error) {
+            if (error) {
+                NSLog(@"[FaceDetector] Detection error: %@", error);
+                [self notifyError:error];
+                return;
+            }
 
-        [self handleDetectionResults:request.results forImage:image];
-    }];
+            [self handleDetectionResults:request.results forImage:normalizedImage];
+        }];
 
-    // Create image request handler
-    VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:cgImage options:@{}];
+    // No orientation parameter needed since the image is already normalized (orientation=Up).
+    // Vision and CGImageCreateWithImageInRect now operate in the same coordinate space.
+    VNImageRequestHandler *handler = [[VNImageRequestHandler alloc]
+        initWithCGImage:cgImage
+                options:@{}];
 
-    // Perform request
     NSError *error = nil;
     if (![handler performRequests:@[request] error:&error]) {
         NSLog(@"[FaceDetector] Failed to perform request: %@", error);
@@ -83,71 +122,97 @@ static CGFloat const kMaxFaceSizeRatio = 0.7;
 
 - (void)handleDetectionResults:(NSArray<VNFaceObservation *> *)results forImage:(UIImage *)image {
     if (!results || results.count == 0) {
-        NSLog(@"[FaceDetector] No faces detected");
+        NSLog(@"[FaceDetector] No faces detected in image");
         [self notifyNoFaceDetected];
         return;
     }
 
     NSLog(@"[FaceDetector] Detected %lu face(s)", (unsigned long)results.count);
 
+    // Log all detected faces for debugging
+    CGFloat imageArea = image.size.width * image.size.height;
+    for (NSUInteger i = 0; i < results.count; i++) {
+        VNFaceObservation *face = results[i];
+        CGRect bbox = face.boundingBox;
+        CGFloat faceArea = (bbox.size.width * image.size.width) * (bbox.size.height * image.size.height);
+        CGFloat areaRatio = faceArea / imageArea;
+        NSLog(@"[FaceDetector] Face %lu: bbox=(%.3f, %.3f, %.3f, %.3f) confidence=%.2f areaRatio=%.4f",
+              (unsigned long)i, bbox.origin.x, bbox.origin.y,
+              bbox.size.width, bbox.size.height,
+              face.confidence, areaRatio);
+    }
+
     // Find the best face
     VNFaceObservation *bestFace = [self findBestFaceInResults:results forImage:image];
 
     if (!bestFace) {
-        NSLog(@"[FaceDetector] No suitable face found");
+        NSLog(@"[FaceDetector] No suitable face found (all rejected by size filter)");
         [self notifyNoFaceDetected];
         return;
     }
 
-    // Extract face region
+    // Extract face region from the normalized image
     UIImage *croppedFace = [self extractFaceRegion:bestFace fromImage:image];
 
     if (croppedFace) {
-        NSLog(@"[FaceDetector] Successfully extracted face");
+        NSLog(@"[FaceDetector] Successfully extracted face portrait, size=%@",
+              NSStringFromCGSize(croppedFace.size));
         [self notifyFaceDetected:croppedFace];
     } else {
+        NSLog(@"[FaceDetector] Failed to crop face region");
         [self notifyNoFaceDetected];
     }
 }
 
-- (VNFaceObservation *)findBestFaceInResults:(NSArray<VNFaceObservation *> *)results forImage:(UIImage *)image {
+- (VNFaceObservation *)findBestFaceInResults:(NSArray<VNFaceObservation *> *)results
+                                    forImage:(UIImage *)image {
     CGFloat imageWidth = image.size.width;
     CGFloat imageHeight = image.size.height;
     CGFloat imageArea = imageWidth * imageHeight;
 
     VNFaceObservation *bestFace = nil;
-    CGFloat bestScore = 0;
+    CGFloat bestScore = -1;
 
     for (VNFaceObservation *face in results) {
         CGRect normalizedBounds = face.boundingBox;
 
-        // Convert normalized coordinates to image coordinates
+        // Calculate face area ratio
         CGFloat faceWidth = normalizedBounds.size.width * imageWidth;
         CGFloat faceHeight = normalizedBounds.size.height * imageHeight;
         CGFloat faceArea = faceWidth * faceHeight;
         CGFloat areaRatio = faceArea / imageArea;
 
-        // Skip faces that are too small or too large
-        if (areaRatio < kMinFaceSizeRatio || areaRatio > kMaxFaceSizeRatio) {
-            NSLog(@"[FaceDetector] Face rejected due to size: ratio=%.4f", areaRatio);
+        // Skip faces outside valid size range
+        if (areaRatio < kMinFaceSizeRatio) {
+            NSLog(@"[FaceDetector] Face rejected: too small (ratio=%.4f, min=%.4f)",
+                  areaRatio, kMinFaceSizeRatio);
+            continue;
+        }
+        if (areaRatio > kMaxFaceSizeRatio) {
+            NSLog(@"[FaceDetector] Face rejected: too large (ratio=%.4f, max=%.4f)",
+                  areaRatio, kMaxFaceSizeRatio);
             continue;
         }
 
-        // Calculate score based on size and position
-        CGFloat sizeScore = faceArea / imageArea;
+        // Score: prioritize larger faces (the license face should be the most prominent).
+        // Size accounts for 70% of the score. Position accounts for 30%.
+        CGFloat sizeScore = areaRatio;
 
-        // US driver licenses typically have photo on the left
-        CGFloat expectedCenterX = 0.25; // Left quarter
-        CGFloat expectedCenterY = 0.6;  // Lower portion (Vision uses bottom-left origin)
-        CGFloat actualCenterX = normalizedBounds.origin.x + normalizedBounds.size.width / 2;
-        CGFloat actualCenterY = normalizedBounds.origin.y + normalizedBounds.size.height / 2;
+        // Position scoring: US driver licenses typically have the photo on the left side.
+        // In a portrait camera frame, the left side of the license (held horizontally)
+        // maps to the left-center of the frame.
+        CGFloat faceCenterX = normalizedBounds.origin.x + normalizedBounds.size.width / 2.0;
+        CGFloat faceCenterY = normalizedBounds.origin.y + normalizedBounds.size.height / 2.0;
 
-        CGFloat positionScore = 1.0 - (
-            fabs(actualCenterX - expectedCenterX) +
-            fabs(actualCenterY - expectedCenterY)
-        ) / 2;
+        // Prefer faces in the left-center area of the frame
+        // Vision coordinate system: (0,0) = bottom-left, (1,1) = top-right
+        CGFloat positionScore = 1.0 - (fabs(faceCenterX - 0.35) + fabs(faceCenterY - 0.5)) / 2.0;
+        positionScore = MAX(0, positionScore);
 
-        CGFloat totalScore = sizeScore * 0.6 + positionScore * 0.4;
+        CGFloat totalScore = sizeScore * 0.7 + positionScore * 0.3;
+
+        NSLog(@"[FaceDetector] Face score: size=%.4f pos=%.4f total=%.4f (center=%.2f,%.2f)",
+              sizeScore, positionScore, totalScore, faceCenterX, faceCenterY);
 
         if (totalScore > bestScore) {
             bestScore = totalScore;
@@ -155,21 +220,33 @@ static CGFloat const kMaxFaceSizeRatio = 0.7;
         }
     }
 
+    if (bestFace) {
+        NSLog(@"[FaceDetector] Selected face with score=%.4f", bestScore);
+    }
+
     return bestFace;
 }
 
 - (UIImage *)extractFaceRegion:(VNFaceObservation *)face fromImage:(UIImage *)image {
     CGRect normalizedBounds = face.boundingBox;
+
+    // Since the image is normalized (orientation=Up), UIImage.size matches
+    // CGImage pixel dimensions. Both Vision and CGImageCreateWithImageInRect
+    // operate in the same coordinate space.
     CGFloat imageWidth = image.size.width;
     CGFloat imageHeight = image.size.height;
 
-    // Convert from Vision coordinates (bottom-left origin) to UIKit (top-left origin)
+    // Convert from Vision coordinates (bottom-left origin, normalized)
+    // to UIKit/CGImage coordinates (top-left origin, pixels)
     CGFloat x = normalizedBounds.origin.x * imageWidth;
     CGFloat y = (1.0 - normalizedBounds.origin.y - normalizedBounds.size.height) * imageHeight;
     CGFloat width = normalizedBounds.size.width * imageWidth;
     CGFloat height = normalizedBounds.size.height * imageHeight;
 
-    // Add padding
+    NSLog(@"[FaceDetector] Face pixel coords: x=%.0f y=%.0f w=%.0f h=%.0f (image: %.0fx%.0f)",
+          x, y, width, height, imageWidth, imageHeight);
+
+    // Add padding around face for a natural portrait crop
     CGFloat paddingX = width * kFacePaddingFactor;
     CGFloat paddingY = height * kFacePaddingFactor;
 
@@ -180,22 +257,25 @@ static CGFloat const kMaxFaceSizeRatio = 0.7;
 
     CGRect cropRect = CGRectMake(left, top, right - left, bottom - top);
 
+    NSLog(@"[FaceDetector] Crop rect with padding: x=%.0f y=%.0f w=%.0f h=%.0f",
+          cropRect.origin.x, cropRect.origin.y, cropRect.size.width, cropRect.size.height);
+
     // Validate crop rect
     if (cropRect.size.width <= 0 || cropRect.size.height <= 0) {
-        NSLog(@"[FaceDetector] Invalid crop rect");
+        NSLog(@"[FaceDetector] Invalid crop rect dimensions");
         return nil;
     }
 
     // Crop the image
     CGImageRef cgImage = CGImageCreateWithImageInRect(image.CGImage, cropRect);
     if (!cgImage) {
-        NSLog(@"[FaceDetector] Failed to crop image");
+        NSLog(@"[FaceDetector] CGImageCreateWithImageInRect failed");
         return nil;
     }
 
     UIImage *croppedImage = [UIImage imageWithCGImage:cgImage
                                                 scale:image.scale
-                                          orientation:image.imageOrientation];
+                                          orientation:UIImageOrientationUp];
     CGImageRelease(cgImage);
 
     return croppedImage;

@@ -41,6 +41,16 @@ NS_ASSUME_NONNULL_BEGIN
 + (nullable UIImage *)extractPortraitDeterministic:(UIImage *)licenseImage;
 
 /**
+ * Normalizes image orientation so CGImage pixels match UIImage display coordinates.
+ * Camera photos typically have imageOrientation != Up, which causes coordinate
+ * mismatches between Vision bounding boxes and CGImage crop rects.
+ *
+ * @param image The image to normalize
+ * @return Image with orientation=Up and pixels in display orientation
+ */
++ (UIImage *)normalizeOrientation:(UIImage *)image;
+
+/**
  * Scales an image to ensure it doesn't exceed the maximum dimension.
  *
  * @param image The original image
