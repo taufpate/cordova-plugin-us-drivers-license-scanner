@@ -2,7 +2,13 @@
  * CameraManager.java
  *
  * Manages CameraX camera operations for the driver license scanner.
- * Handles preview, image capture, and barcode analysis.
+ * Handles preview, image capture, barcode analysis, and face detection routing.
+ *
+ * Features matching iOS CameraManager:
+ * - Frame throttling (skip every 2nd frame) to reduce memory pressure
+ * - Auto-torch after ~3s without barcode detection
+ * - Face detection mode for front scan
+ * - Video frame delivery for both barcode and face detection
  */
 package com.sos.driverslicensescanner;
 
@@ -41,25 +47,40 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Manages CameraX camera operations including preview, capture, and barcode analysis.
+ * Manages CameraX camera operations including preview, capture, barcode analysis,
+ * and face detection frame routing.
  */
 public class CameraManager {
 
     private static final String TAG = "CameraManager";
 
-    // Target resolution for analysis (good balance of speed and quality)
+    // Target resolution for analysis
     private static final int ANALYSIS_WIDTH = 1280;
     private static final int ANALYSIS_HEIGHT = 720;
 
-    // Target resolution for capture (higher quality)
+    // Target resolution for capture
     private static final int CAPTURE_WIDTH = 1920;
     private static final int CAPTURE_HEIGHT = 1080;
+
+    // Process every Nth frame for analysis (matches iOS kFrameSkipInterval = 2)
+    private static final int FRAME_SKIP_INTERVAL = 2;
+
+    // Auto-torch threshold: after this many delivered video frames without barcode
+    // detection, enable torch. At ~30fps with skip=2, ~15 delivered frames/sec,
+    // threshold 45 = ~3 seconds. Matches iOS kAutoTorchFrameThreshold = 45.
+    private static final int AUTO_TORCH_FRAME_THRESHOLD = 45;
 
     // Callback interface for scan events
     public interface ScanCallback {
         void onImageCaptured(Bitmap image);
         void onBarcodeDetected(String rawData);
         void onScanError(String errorCode, String errorMessage);
+        /**
+         * Called with each delivered video frame. Used for live face detection
+         * during front scan. The bitmap should NOT be recycled by the caller
+         * as it will be managed by CameraManager.
+         */
+        void onVideoFrameAvailable(Bitmap frame);
     }
 
     private final Context context;
@@ -75,8 +96,16 @@ public class CameraManager {
     private Preview preview;
 
     private boolean isBarcodeScanning = false;
+    private boolean isFaceDetectionMode = false;
     private boolean isCapturing = false;
     private boolean isCameraRunning = false;
+
+    // Frame throttling counter
+    private int frameCounter = 0;
+
+    // Auto-torch: enable torch when barcode isn't detected for a while
+    private int framesSinceLastDetection = 0;
+    private boolean autoTorchActive = false;
 
     /**
      * Creates a new CameraManager instance.
@@ -99,9 +128,29 @@ public class CameraManager {
      * @param enableBarcodeScanning True to enable PDF417 barcode scanning
      */
     public void startCamera(boolean enableBarcodeScanning) {
-        Log.d(TAG, "Starting camera, barcodeScanning=" + enableBarcodeScanning);
+        startCamera(enableBarcodeScanning, false);
+    }
+
+    /**
+     * Starts the camera with specified mode and optional face detection.
+     *
+     * @param enableBarcodeScanning True to enable PDF417 barcode scanning
+     * @param enableFaceDetection True to enable face detection mode (delivers video frames)
+     */
+    public void startCamera(boolean enableBarcodeScanning, boolean enableFaceDetection) {
+        Log.d(TAG, "Starting camera, barcodeScanning=" + enableBarcodeScanning +
+                ", faceDetection=" + enableFaceDetection);
 
         this.isBarcodeScanning = enableBarcodeScanning;
+        this.isFaceDetectionMode = enableFaceDetection;
+        this.frameCounter = 0;
+        this.framesSinceLastDetection = 0;
+
+        // Turn off auto-torch from previous scan phase
+        if (autoTorchActive) {
+            autoTorchActive = false;
+            setFlash(false);
+        }
 
         ListenableFuture<ProcessCameraProvider> cameraProviderFuture =
                 ProcessCameraProvider.getInstance(context);
@@ -124,11 +173,19 @@ public class CameraManager {
     public void stopCamera() {
         Log.d(TAG, "Stopping camera");
 
+        // Turn off auto-torch before stopping
+        if (autoTorchActive) {
+            autoTorchActive = false;
+            setFlash(false);
+        }
+
         if (cameraProvider != null) {
             cameraProvider.unbindAll();
         }
 
         isCameraRunning = false;
+        isBarcodeScanning = false;
+        isFaceDetectionMode = false;
     }
 
     /**
@@ -175,18 +232,18 @@ public class CameraManager {
                 .setTargetResolution(new Size(CAPTURE_WIDTH, CAPTURE_HEIGHT))
                 .build();
 
-        // Image analysis use case (for barcode scanning)
+        // Image analysis use case (for barcode scanning and face detection frames)
         imageAnalysis = new ImageAnalysis.Builder()
                 .setTargetResolution(new Size(ANALYSIS_WIDTH, ANALYSIS_HEIGHT))
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build();
 
-        if (isBarcodeScanning) {
+        // Set analyzer if barcode scanning or face detection is enabled
+        if (isBarcodeScanning || isFaceDetectionMode) {
             imageAnalysis.setAnalyzer(cameraExecutor, this::analyzeImage);
         }
 
         try {
-            // Bind use cases to camera
             camera = cameraProvider.bindToLifecycle(
                     (LifecycleOwner) context,
                     cameraSelector,
@@ -204,11 +261,20 @@ public class CameraManager {
     }
 
     /**
-     * Analyzes an image frame for barcode detection.
+     * Analyzes an image frame for barcode detection or face detection.
+     * Implements frame throttling matching iOS (skip every 2nd frame).
      */
     @OptIn(markerClass = ExperimentalGetImage.class)
     private void analyzeImage(@NonNull ImageProxy imageProxy) {
-        if (!isBarcodeScanning) {
+        // Must be in a scanning or face detection mode
+        if (!isBarcodeScanning && !isFaceDetectionMode) {
+            imageProxy.close();
+            return;
+        }
+
+        // Frame throttling: process every Nth frame
+        frameCounter++;
+        if (frameCounter % FRAME_SKIP_INTERVAL != 0) {
             imageProxy.close();
             return;
         }
@@ -220,11 +286,25 @@ public class CameraManager {
         }
 
         try {
-            // Convert to bitmap for ZXing processing
             Bitmap bitmap = imageProxyToBitmap(imageProxy);
             if (bitmap != null) {
-                barcodeAnalyzer.analyze(bitmap);
-                bitmap.recycle();
+                if (isFaceDetectionMode) {
+                    // Face detection mode: deliver frame to callback for face checking
+                    callback.onVideoFrameAvailable(bitmap);
+                    // Don't recycle — the callback consumer is responsible
+                } else if (isBarcodeScanning) {
+                    // Barcode scanning mode: analyze for barcodes
+                    barcodeAnalyzer.analyze(bitmap);
+                    bitmap.recycle();
+
+                    // Auto-torch: if barcode hasn't been detected after many frames,
+                    // enable torch to reduce motion blur from long exposure
+                    framesSinceLastDetection++;
+                    if (!autoTorchActive && framesSinceLastDetection >= AUTO_TORCH_FRAME_THRESHOLD) {
+                        autoTorchActive = true;
+                        enableAutoTorch();
+                    }
+                }
             }
         } catch (Exception e) {
             Log.e(TAG, "Error analyzing image", e);
@@ -243,7 +323,6 @@ public class CameraManager {
             return null;
         }
 
-        // Get image planes
         Image.Plane[] planes = image.getPlanes();
         ByteBuffer yBuffer = planes[0].getBuffer();
         ByteBuffer uBuffer = planes[1].getBuffer();
@@ -253,13 +332,11 @@ public class CameraManager {
         int uSize = uBuffer.remaining();
         int vSize = vBuffer.remaining();
 
-        // Convert YUV to NV21
         byte[] nv21 = new byte[ySize + uSize + vSize];
         yBuffer.get(nv21, 0, ySize);
         vBuffer.get(nv21, ySize, vSize);
         uBuffer.get(nv21, ySize + vSize, uSize);
 
-        // Convert to JPEG then to Bitmap
         YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21, image.getWidth(), image.getHeight(), null);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         yuvImage.compressToJpeg(new Rect(0, 0, image.getWidth(), image.getHeight()), 90, out);
@@ -267,7 +344,6 @@ public class CameraManager {
         byte[] jpegBytes = out.toByteArray();
         Bitmap bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
 
-        // Rotate bitmap according to rotation degrees
         int rotation = imageProxy.getImageInfo().getRotationDegrees();
         if (rotation != 0) {
             Matrix matrix = new Matrix();
@@ -286,7 +362,23 @@ public class CameraManager {
     private void onBarcodeResult(String rawData) {
         if (rawData != null && !rawData.isEmpty() && isBarcodeScanning) {
             Log.d(TAG, "Barcode detected, data length=" + rawData.length());
+
+            // Reset auto-torch counter — barcode was found
+            framesSinceLastDetection = 0;
+
             callback.onBarcodeDetected(rawData);
+        }
+    }
+
+    /**
+     * Enables torch at moderate intensity when barcode scanning is struggling.
+     * Low light causes the camera to lengthen exposure, which introduces motion
+     * blur that makes PDF417 barcodes unreadable.
+     */
+    private void enableAutoTorch() {
+        if (camera != null && camera.getCameraInfo().hasFlashUnit()) {
+            camera.getCameraControl().enableTorch(true);
+            Log.d(TAG, "Auto-torch enabled (no barcode for ~3s)");
         }
     }
 
@@ -352,9 +444,6 @@ public class CameraManager {
      */
     public void setFocusPoint(float x, float y) {
         if (camera == null) return;
-
-        // Create focus metering action
-        // Note: Implementation would require MeteringPointFactory, omitted for simplicity
         Log.d(TAG, "Focus point set to (" + x + ", " + y + ")");
     }
 
@@ -372,11 +461,21 @@ public class CameraManager {
         this.isBarcodeScanning = enable;
 
         if (imageAnalysis != null) {
-            if (enable) {
+            if (enable || isFaceDetectionMode) {
                 imageAnalysis.setAnalyzer(cameraExecutor, this::analyzeImage);
             } else {
                 imageAnalysis.clearAnalyzer();
             }
+        }
+    }
+
+    /**
+     * Resets the barcode analyzer strategy index. Call when starting a new scan phase.
+     */
+    public void resetBarcodeAnalyzer() {
+        if (barcodeAnalyzer != null) {
+            barcodeAnalyzer.resetStrategyIndex();
+            barcodeAnalyzer.resetDebounce();
         }
     }
 }

@@ -4,6 +4,9 @@
  * AVFoundation camera manager implementation for the driver license scanner.
  * Uses AVCaptureMetadataOutput for native PDF417 detection (primary),
  * plus video frame delivery for ZXingObjC fallback decoding.
+ *
+ * All session configuration is wrapped in beginConfiguration/commitConfiguration
+ * to prevent the session from being left in a dirty state on internal errors.
  */
 
 #import "CameraManager.h"
@@ -23,6 +26,7 @@
 @property (nonatomic, strong) dispatch_queue_t sessionQueue;
 @property (nonatomic, strong) dispatch_queue_t videoQueue;
 @property (nonatomic, assign) BOOL isRunning;
+@property (nonatomic, assign) BOOL isSessionConfigured;
 @property (nonatomic, assign) BOOL isBarcodeScanning;
 @property (nonatomic, assign) BOOL isCapturing;
 @property (nonatomic, assign) BOOL isObservingBounds;
@@ -30,10 +34,20 @@
 // Frame throttling: skip frames to avoid memory pressure
 @property (nonatomic, assign) NSInteger frameCounter;
 
+// Auto-torch: enable torch automatically when barcode isn't detected for a while.
+// Low light causes the camera to use longer exposure → motion blur → harder to read.
+@property (nonatomic, assign) NSInteger framesSinceLastDetection;
+@property (nonatomic, assign) BOOL autoTorchActive;
+
 @end
 
 // Process every Nth frame for ZXingObjC fallback (native metadata is always active)
-static NSInteger const kFrameSkipInterval = 3;
+static NSInteger const kFrameSkipInterval = 2;
+
+// Auto-torch threshold: after this many delivered video frames without a barcode
+// detection, enable torch at moderate intensity. At ~30fps with skip=2, this is
+// ~15 delivered frames/sec → threshold 45 ≈ 3 seconds.
+static NSInteger const kAutoTorchFrameThreshold = 45;
 
 @implementation CameraManager
 
@@ -46,10 +60,13 @@ static NSInteger const kFrameSkipInterval = 3;
         _sessionQueue = dispatch_queue_create("com.sos.camera.session", DISPATCH_QUEUE_SERIAL);
         _videoQueue = dispatch_queue_create("com.sos.camera.video", DISPATCH_QUEUE_SERIAL);
         _isRunning = NO;
+        _isSessionConfigured = NO;
         _isBarcodeScanning = NO;
         _isCapturing = NO;
         _isObservingBounds = NO;
         _frameCounter = 0;
+        _framesSinceLastDetection = 0;
+        _autoTorchActive = NO;
 
         [self setupSession];
     }
@@ -68,7 +85,13 @@ static NSInteger const kFrameSkipInterval = 3;
     dispatch_async(self.sessionQueue, ^{
         self.captureSession = [[AVCaptureSession alloc] init];
 
-        // Use 1920x1080 for better barcode resolution, fall back to 1280x720
+        // Wrap ALL configuration in beginConfiguration/commitConfiguration.
+        // This prevents the session from being left in a dirty state if any
+        // internal AVFoundation error occurs (e.g. FigXPCUtilities -17281),
+        // which would cause startRunning to crash.
+        [self.captureSession beginConfiguration];
+
+        // Set preset — try 1080p, fall back to 720p
         if ([self.captureSession canSetSessionPreset:AVCaptureSessionPreset1920x1080]) {
             self.captureSession.sessionPreset = AVCaptureSessionPreset1920x1080;
             NSLog(@"[CameraManager] Using 1920x1080 preset");
@@ -83,6 +106,7 @@ static NSInteger const kFrameSkipInterval = 3;
                                                                  position:AVCaptureDevicePositionBack];
 
         if (!self.captureDevice) {
+            [self.captureSession commitConfiguration];
             [self notifyErrorWithCode:@"CAMERA_NOT_AVAILABLE" message:@"Back camera not available"];
             return;
         }
@@ -91,8 +115,10 @@ static NSInteger const kFrameSkipInterval = 3;
 
         // Device input
         self.deviceInput = [AVCaptureDeviceInput deviceInputWithDevice:self.captureDevice error:&error];
-        if (error) {
-            [self notifyErrorWithCode:@"CAMERA_NOT_AVAILABLE" message:error.localizedDescription];
+        if (error || !self.deviceInput) {
+            [self.captureSession commitConfiguration];
+            [self notifyErrorWithCode:@"CAMERA_NOT_AVAILABLE"
+                              message:error.localizedDescription ?: @"Could not create camera input"];
             return;
         }
 
@@ -109,13 +135,6 @@ static NSInteger const kFrameSkipInterval = 3;
 
         if ([self.captureSession canAddOutput:self.videoOutput]) {
             [self.captureSession addOutput:self.videoOutput];
-
-            // Set video orientation to portrait so ZXingObjC receives correctly oriented frames
-            AVCaptureConnection *videoConnection = [self.videoOutput connectionWithMediaType:AVMediaTypeVideo];
-            if (videoConnection && videoConnection.isVideoOrientationSupported) {
-                videoConnection.videoOrientation = AVCaptureVideoOrientationPortrait;
-                NSLog(@"[CameraManager] Video output orientation set to portrait");
-            }
         }
 
         // Photo output for image capture
@@ -125,31 +144,38 @@ static NSInteger const kFrameSkipInterval = 3;
         }
 
         // Native metadata output for PDF417 detection (primary barcode detector)
-        // AVCaptureMetadataOutput is dramatically more reliable than ZXingObjC for PDF417
         self.metadataOutput = [[AVCaptureMetadataOutput alloc] init];
         if ([self.captureSession canAddOutput:self.metadataOutput]) {
             [self.captureSession addOutput:self.metadataOutput];
 
             // metadataObjectTypes must be set AFTER adding output to the session
             NSArray *availableTypes = self.metadataOutput.availableMetadataObjectTypes;
-            NSMutableArray *desiredTypes = [NSMutableArray array];
-
             if ([availableTypes containsObject:AVMetadataObjectTypePDF417Code]) {
-                [desiredTypes addObject:AVMetadataObjectTypePDF417Code];
-            }
-
-            if (desiredTypes.count > 0) {
-                self.metadataOutput.metadataObjectTypes = desiredTypes;
+                self.metadataOutput.metadataObjectTypes = @[AVMetadataObjectTypePDF417Code];
                 NSLog(@"[CameraManager] Native PDF417 metadata detection enabled");
             } else {
-                NSLog(@"[CameraManager] WARNING: PDF417 not available in native metadata output");
+                NSLog(@"[CameraManager] WARNING: PDF417 not in available metadata types");
             }
         } else {
             NSLog(@"[CameraManager] WARNING: Could not add metadata output to session");
         }
 
+        // Commit all configuration atomically — this is the critical fix.
+        // Even if internal errors occurred above, the session will be left
+        // in a clean, non-configuring state so startRunning won't crash.
+        [self.captureSession commitConfiguration];
+
+        // Set video orientation AFTER commitConfiguration (connection is now stable)
+        AVCaptureConnection *videoConnection = [self.videoOutput connectionWithMediaType:AVMediaTypeVideo];
+        if (videoConnection && videoConnection.isVideoOrientationSupported) {
+            videoConnection.videoOrientation = AVCaptureVideoOrientationPortrait;
+            NSLog(@"[CameraManager] Video output orientation set to portrait");
+        }
+
         // Configure device (autofocus, exposure, white balance)
         [self configureDevice];
+
+        self.isSessionConfigured = YES;
 
         // Setup preview layer on main thread
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -166,6 +192,14 @@ static NSInteger const kFrameSkipInterval = 3;
         // Enable continuous autofocus
         if ([self.captureDevice isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus]) {
             self.captureDevice.focusMode = AVCaptureFocusModeContinuousAutoFocus;
+        }
+
+        // Restrict autofocus to near range — we're scanning a document held
+        // close to the camera. This makes autofocus converge faster and avoids
+        // hunting at far distances, reducing defocus blur on the license.
+        if ([self.captureDevice isAutoFocusRangeRestrictionSupported]) {
+            self.captureDevice.autoFocusRangeRestriction = AVCaptureAutoFocusRangeRestrictionNear;
+            NSLog(@"[CameraManager] Autofocus restricted to near range");
         }
 
         // Enable auto exposure
@@ -236,8 +270,21 @@ static NSInteger const kFrameSkipInterval = 3;
 
     self.isBarcodeScanning = enableBarcodeScanning;
     self.frameCounter = 0;
+    self.framesSinceLastDetection = 0;
+
+    // Turn off auto-torch from previous scan phase (e.g. switching from back to front)
+    if (self.autoTorchActive) {
+        self.autoTorchActive = NO;
+        [self setFlash:NO];
+    }
 
     dispatch_async(self.sessionQueue, ^{
+        // Guard: session must be fully configured before starting
+        if (!self.isSessionConfigured) {
+            NSLog(@"[CameraManager] ERROR: session not configured, cannot start");
+            return;
+        }
+
         // Configure video output delegate (for ZXingObjC fallback + face detection)
         if (enableBarcodeScanning) {
             [self.videoOutput setSampleBufferDelegate:self queue:self.videoQueue];
@@ -263,6 +310,12 @@ static NSInteger const kFrameSkipInterval = 3;
 
 - (void)stopCamera {
     NSLog(@"[CameraManager] Stopping camera");
+
+    // Turn off auto-torch before stopping
+    if (self.autoTorchActive) {
+        self.autoTorchActive = NO;
+        [self setFlash:NO];
+    }
 
     // Remove delegates first to stop receiving frames/metadata immediately
     [self.videoOutput setSampleBufferDelegate:nil queue:nil];
@@ -359,7 +412,9 @@ didOutputMetadataObjects:(NSArray<__kindof AVMetadataObject *> *)metadataObjects
 
                 if (data && data.length > 0) {
                     NSLog(@"[CameraManager] *** NATIVE PDF417 DETECTED *** length=%lu", (unsigned long)data.length);
-                    NSLog(@"[CameraManager] Native PDF417 first 80 chars: %@", [data substringToIndex:MIN(80, data.length)]);
+
+                    // Reset auto-torch counter — barcode was found
+                    self.framesSinceLastDetection = 0;
 
                     if ([self.delegate respondsToSelector:@selector(cameraManager:didDetectBarcodeData:)]) {
                         [self.delegate cameraManager:self didDetectBarcodeData:data];
@@ -388,8 +443,45 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         return;
     }
 
+    // Auto-torch: if barcode hasn't been detected after many frames, the
+    // issue is likely low light causing motion blur. Enable torch at moderate
+    // intensity to improve both native and ZXingObjC detection.
+    self.framesSinceLastDetection++;
+    if (!self.autoTorchActive && self.framesSinceLastDetection >= kAutoTorchFrameThreshold) {
+        self.autoTorchActive = YES;
+        [self enableAutoTorch];
+    }
+
     // Deliver to delegate for ZXingObjC processing or face detection
     [self.delegate cameraManager:self didReceiveSampleBuffer:sampleBuffer];
+}
+
+#pragma mark - Auto-Torch
+
+/**
+ * Enables torch at moderate intensity (~50%) when barcode scanning is
+ * struggling. Low light causes the camera to lengthen exposure, which
+ * introduces motion blur that makes PDF417 barcodes unreadable.
+ * The torch provides enough fill light to let the camera use a fast
+ * shutter speed, dramatically reducing blur.
+ */
+- (void)enableAutoTorch {
+    dispatch_async(self.sessionQueue, ^{
+        if ([self.captureDevice hasTorch] && self.captureDevice.torchMode == AVCaptureTorchModeOff) {
+            NSError *error = nil;
+            if ([self.captureDevice lockForConfiguration:&error]) {
+                // Use 50% torch — bright enough to help, not so bright
+                // that it causes glare on laminated licenses
+                BOOL success = [self.captureDevice setTorchModeOnWithLevel:0.5 error:&error];
+                [self.captureDevice unlockForConfiguration];
+                if (success) {
+                    NSLog(@"[CameraManager] Auto-torch enabled (no barcode for ~3s)");
+                } else {
+                    NSLog(@"[CameraManager] Auto-torch failed: %@", error);
+                }
+            }
+        }
+    });
 }
 
 #pragma mark - Flash Control

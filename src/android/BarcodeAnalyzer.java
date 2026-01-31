@@ -1,8 +1,24 @@
 /**
  * BarcodeAnalyzer.java
  *
- * PDF417 barcode analyzer using ZXing library.
- * Specifically optimized for decoding AAMVA-compliant US driver license barcodes.
+ * PDF417 barcode analyzer using ZXing library with strategy-rotation image processing.
+ *
+ * To avoid starving the decoder of fresh frames, only TWO strategies are
+ * tried per frame: the original (HybridBinarizer) plus ONE rotating enhanced
+ * strategy. The enhanced strategies cycle across consecutive frames:
+ *
+ *   Frame N+0: original + GlobalHistogramBinarizer
+ *   Frame N+1: original + sharpened-contrast
+ *   Frame N+2: original + high-contrast-grayscale
+ *   Frame N+3: original + anti-reflection
+ *   Frame N+4: original + rotated-90°
+ *   Frame N+5: original + luminance-sharpen (blur recovery)
+ *   Frame N+6: original + downscale-50% (blur averaging)
+ *   Frame N+7: original + large-radius deblur
+ *   Frame N+8: (cycle repeats)
+ *
+ * This keeps per-frame processing ~25ms instead of ~80ms when all ran,
+ * preventing the isProcessing flag from blocking fresh frames too long.
  */
 package com.sos.driverslicensescanner;
 
@@ -17,23 +33,26 @@ import com.google.zxing.MultiFormatReader;
 import com.google.zxing.NotFoundException;
 import com.google.zxing.RGBLuminanceSource;
 import com.google.zxing.Result;
+import com.google.zxing.common.GlobalHistogramBinarizer;
 import com.google.zxing.common.HybridBinarizer;
 import com.google.zxing.pdf417.PDF417Reader;
 
 import java.util.ArrayList;
 import java.util.EnumMap;
-import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Analyzes images for PDF417 barcodes using ZXing.
- * Optimized for US driver license barcode scanning.
+ * Uses iOS-matching strategy rotation: original + 1 rotating enhanced per frame.
  */
 public class BarcodeAnalyzer {
 
     private static final String TAG = "BarcodeAnalyzer";
+
+    // Number of enhanced strategies to rotate through (excludes the original which always runs)
+    private static final int ENHANCED_STRATEGY_COUNT = 8;
 
     /**
      * Callback interface for barcode detection results.
@@ -48,10 +67,13 @@ public class BarcodeAnalyzer {
     private final Map<DecodeHintType, Object> hints;
     private final AtomicBoolean isProcessing;
 
+    // Strategy rotation index — cycles 0..7 across frames
+    private int strategyIndex;
+
     // Debounce: avoid reporting the same barcode repeatedly
     private String lastDetectedData;
     private long lastDetectionTime;
-    private static final long DEBOUNCE_MS = 1000; // 1 second debounce
+    private static final long DEBOUNCE_MS = 1000;
 
     /**
      * Creates a new BarcodeAnalyzer.
@@ -63,14 +85,13 @@ public class BarcodeAnalyzer {
         this.pdf417Reader = new PDF417Reader();
         this.multiFormatReader = new MultiFormatReader();
         this.isProcessing = new AtomicBoolean(false);
+        this.strategyIndex = 0;
 
         // Configure hints for optimal PDF417 decoding
         hints = new EnumMap<>(DecodeHintType.class);
 
-        // Specify we're looking for PDF417 (primary) and fallback formats
         List<BarcodeFormat> formats = new ArrayList<>();
         formats.add(BarcodeFormat.PDF_417);
-        // Also try these in case the barcode uses alternative encoding
         formats.add(BarcodeFormat.DATA_MATRIX);
         formats.add(BarcodeFormat.QR_CODE);
         hints.put(DecodeHintType.POSSIBLE_FORMATS, formats);
@@ -81,14 +102,13 @@ public class BarcodeAnalyzer {
         // Use ISO-8859-1 character set (common for AAMVA data)
         hints.put(DecodeHintType.CHARACTER_SET, "ISO-8859-1");
 
-        // Allow detection of multiple barcodes (in case of retry scenarios)
         hints.put(DecodeHintType.PURE_BARCODE, Boolean.FALSE);
 
         multiFormatReader.setHints(hints);
     }
 
     /**
-     * Analyzes a bitmap image for PDF417 barcodes.
+     * Analyzes a bitmap image for PDF417 barcodes using strategy rotation.
      *
      * @param bitmap The image to analyze
      */
@@ -125,80 +145,393 @@ public class BarcodeAnalyzer {
     }
 
     /**
-     * Decodes a bitmap image looking for PDF417 barcodes.
-     * Tries multiple strategies for robust detection.
-     *
-     * @param bitmap The image to decode
-     * @return The decoded barcode data, or null if not found
+     * Decodes a bitmap using strategy rotation matching iOS implementation.
+     * Always tries original (HybridBinarizer) first, then one rotating enhanced strategy.
      */
     private String decodeBitmap(Bitmap bitmap) {
         if (bitmap == null) {
             return null;
         }
 
-        // Convert bitmap to ZXing-compatible format
         int width = bitmap.getWidth();
         int height = bitmap.getHeight();
         int[] pixels = new int[width * height];
         bitmap.getPixels(pixels, 0, width, 0, 0, width, height);
 
-        // Try original orientation first
+        // ---- Always try the original image first (HybridBinarizer) ----
         String result = tryDecode(pixels, width, height);
         if (result != null) {
             return result;
         }
 
-        // Try rotated 90 degrees (in case license is held sideways)
-        int[] rotated90 = rotatePixels90(pixels, width, height);
-        result = tryDecode(rotated90, height, width);
-        if (result != null) {
-            return result;
+        // ---- If original failed, try ONE rotating enhanced strategy ----
+        int idx = strategyIndex % ENHANCED_STRATEGY_COUNT;
+        strategyIndex++;
+
+        switch (idx) {
+            case 0: {
+                // GlobalHistogramBinarizer — different thresholding
+                result = tryDecodeWithGlobalBinarizer(pixels, width, height);
+                if (result != null) {
+                    Log.d(TAG, "Decoded via global-histogram strategy");
+                }
+                break;
+            }
+            case 1: {
+                // Sharpened + contrast + desaturated (3x3 unsharp mask)
+                int[] enhanced = createSharpenedContrastImage(pixels, width, height);
+                if (enhanced != null) {
+                    result = tryDecode(enhanced, width, height);
+                    if (result != null) {
+                        Log.d(TAG, "Decoded via sharpened-contrast strategy");
+                    }
+                }
+                break;
+            }
+            case 2: {
+                // High-contrast grayscale (near-binary)
+                int[] grayscale = createHighContrastGrayscaleImage(pixels, width, height);
+                if (grayscale != null) {
+                    result = tryDecode(grayscale, width, height);
+                    if (result != null) {
+                        Log.d(TAG, "Decoded via high-contrast-grayscale strategy");
+                    }
+                }
+                break;
+            }
+            case 3: {
+                // Anti-reflection (highlight compress + shadow lift)
+                int[] antiReflect = createAntiReflectionImage(pixels, width, height);
+                if (antiReflect != null) {
+                    result = tryDecode(antiReflect, width, height);
+                    if (result != null) {
+                        Log.d(TAG, "Decoded via anti-reflection strategy");
+                    }
+                }
+                break;
+            }
+            case 4: {
+                // 90° rotation fallback
+                int[] rotated90 = rotatePixels90(pixels, width, height);
+                result = tryDecode(rotated90, height, width);
+                if (result != null) {
+                    Log.d(TAG, "Decoded via rotated-90 strategy");
+                }
+                break;
+            }
+            case 5: {
+                // Luminance-only sharpening — recovers edges without color artifacts
+                int[] sharpLum = createLuminanceSharpenedImage(pixels, width, height);
+                if (sharpLum != null) {
+                    result = tryDecode(sharpLum, width, height);
+                    if (result != null) {
+                        Log.d(TAG, "Decoded via luminance-sharpen strategy");
+                    }
+                }
+                break;
+            }
+            case 6: {
+                // Downscale 50% — pixel averaging smooths out blur/noise
+                Bitmap downscaled = Bitmap.createScaledBitmap(bitmap, width / 2, height / 2, true);
+                if (downscaled != null) {
+                    int dw = downscaled.getWidth();
+                    int dh = downscaled.getHeight();
+                    int[] dPixels = new int[dw * dh];
+                    downscaled.getPixels(dPixels, 0, dw, 0, 0, dw, dh);
+                    downscaled.recycle();
+                    result = tryDecode(dPixels, dw, dh);
+                    if (result != null) {
+                        Log.d(TAG, "Decoded via downscale-50 strategy");
+                    }
+                }
+                break;
+            }
+            case 7: {
+                // Large-radius deblur (7x7 box-blur-based unsharp mask)
+                int[] deblurred = createDeblurredImage(pixels, width, height);
+                if (deblurred != null) {
+                    result = tryDecode(deblurred, width, height);
+                    if (result != null) {
+                        Log.d(TAG, "Decoded via deblur strategy");
+                    }
+                }
+                break;
+            }
+            default:
+                break;
         }
 
-        // Try rotated 180 degrees (upside down)
-        int[] rotated180 = rotatePixels180(pixels, width, height);
-        result = tryDecode(rotated180, width, height);
-        if (result != null) {
-            return result;
+        return result;
+    }
+
+    // ==================== Image Processing Strategies ====================
+
+    /**
+     * Sharpens barcode module edges (3x3 unsharp mask), increases contrast,
+     * and removes colour information so the binarizer sees cleaner edges.
+     * Best for: slightly worn or slightly blurry barcodes.
+     */
+    private int[] createSharpenedContrastImage(int[] pixels, int width, int height) {
+        // 3x3 unsharp mask kernel: sharpen center, subtract neighbors
+        int[] sharpened = new int[pixels.length];
+
+        for (int y = 1; y < height - 1; y++) {
+            for (int x = 1; x < width - 1; x++) {
+                int idx = y * width + x;
+
+                int center = pixels[idx];
+                int cR = (center >> 16) & 0xFF;
+                int cG = (center >> 8) & 0xFF;
+                int cB = center & 0xFF;
+
+                // Average of 4 neighbors
+                int top = pixels[(y - 1) * width + x];
+                int bot = pixels[(y + 1) * width + x];
+                int left = pixels[y * width + (x - 1)];
+                int right = pixels[y * width + (x + 1)];
+
+                int avgR = (((top >> 16) & 0xFF) + ((bot >> 16) & 0xFF) +
+                        ((left >> 16) & 0xFF) + ((right >> 16) & 0xFF)) / 4;
+                int avgG = (((top >> 8) & 0xFF) + ((bot >> 8) & 0xFF) +
+                        ((left >> 8) & 0xFF) + ((right >> 8) & 0xFF)) / 4;
+                int avgB = ((top & 0xFF) + (bot & 0xFF) +
+                        (left & 0xFF) + (right & 0xFF)) / 4;
+
+                // Unsharp mask: result = center + intensity * (center - blurred)
+                float intensity = 2.5f;
+                int sR = clamp((int) (cR + intensity * (cR - avgR)));
+                int sG = clamp((int) (cG + intensity * (cG - avgG)));
+                int sB = clamp((int) (cB + intensity * (cB - avgB)));
+
+                // Contrast boost (1.5x around midpoint) + full desaturation
+                int lum = luminance(sR, sG, sB);
+                int contrasted = clamp((int) ((lum - 128) * 1.5f + 128));
+
+                sharpened[idx] = 0xFF000000 | (contrasted << 16) | (contrasted << 8) | contrasted;
+            }
         }
 
-        // Try rotated 270 degrees
-        int[] rotated270 = rotatePixels270(pixels, width, height);
-        result = tryDecode(rotated270, height, width);
-        if (result != null) {
-            return result;
+        // Copy edges
+        for (int x = 0; x < width; x++) {
+            sharpened[x] = pixels[x];
+            sharpened[(height - 1) * width + x] = pixels[(height - 1) * width + x];
+        }
+        for (int y = 0; y < height; y++) {
+            sharpened[y * width] = pixels[y * width];
+            sharpened[y * width + width - 1] = pixels[y * width + width - 1];
         }
 
-        // Try with contrast enhancement for low-quality images
-        int[] enhanced = enhanceContrast(pixels, width, height);
-        result = tryDecode(enhanced, width, height);
-        if (result != null) {
-            return result;
-        }
-
-        return null;
+        return sharpened;
     }
 
     /**
-     * Attempts to decode barcode from pixel array.
+     * Full grayscale with aggressive contrast — pushes the image toward binary.
+     * Best for: heavily worn, faded, or low-contrast barcodes.
+     */
+    private int[] createHighContrastGrayscaleImage(int[] pixels, int width, int height) {
+        int[] result = new int[pixels.length];
+
+        for (int i = 0; i < pixels.length; i++) {
+            int pixel = pixels[i];
+            int r = (pixel >> 16) & 0xFF;
+            int g = (pixel >> 8) & 0xFF;
+            int b = pixel & 0xFF;
+
+            // Full desaturation
+            int lum = luminance(r, g, b);
+
+            // Heavy contrast (2.5x) + slight brightness lift
+            int val = clamp((int) ((lum - 128) * 2.5f + 128 + 12));
+
+            result[i] = 0xFF000000 | (val << 16) | (val << 8) | val;
+        }
+
+        return result;
+    }
+
+    /**
+     * Counteracts reflections and glare by compressing highlights and
+     * lifting shadows, then boosting contrast.
+     * Best for: shiny/laminated licenses with specular reflections.
+     */
+    private int[] createAntiReflectionImage(int[] pixels, int width, int height) {
+        int[] result = new int[pixels.length];
+
+        for (int i = 0; i < pixels.length; i++) {
+            int pixel = pixels[i];
+            int r = (pixel >> 16) & 0xFF;
+            int g = (pixel >> 8) & 0xFF;
+            int b = pixel & 0xFF;
+
+            // Tame highlights (compress values above 180) and lift shadows (boost below 75)
+            r = antiReflectChannel(r);
+            g = antiReflectChannel(g);
+            b = antiReflectChannel(b);
+
+            // Desaturate
+            int lum = luminance(r, g, b);
+
+            // Contrast boost (1.8x)
+            int val = clamp((int) ((lum - 128) * 1.8f + 128));
+
+            result[i] = 0xFF000000 | (val << 16) | (val << 8) | val;
+        }
+
+        return result;
+    }
+
+    /** Compress highlights, lift shadows for a single channel. */
+    private int antiReflectChannel(int val) {
+        if (val > 180) {
+            // Compress highlights: map 180-255 to 180-210
+            val = 180 + (int) ((val - 180) * 0.4f);
+        } else if (val < 75) {
+            // Lift shadows: map 0-75 to 30-75
+            val = 30 + (int) ((val / 75.0f) * 45);
+        }
+        return clamp(val);
+    }
+
+    /**
+     * Luminance-only sharpening. Unlike the unsharp mask in strategy 1,
+     * this only sharpens the brightness channel, avoiding colour artifacts.
+     * Best for: moderate blur where barcode edges are soft but visible.
+     */
+    private int[] createLuminanceSharpenedImage(int[] pixels, int width, int height) {
+        int[] result = new int[pixels.length];
+
+        // First pass: compute luminance and apply sharpening
+        int[] lumArr = new int[pixels.length];
+        for (int i = 0; i < pixels.length; i++) {
+            int pixel = pixels[i];
+            lumArr[i] = luminance((pixel >> 16) & 0xFF, (pixel >> 8) & 0xFF, pixel & 0xFF);
+        }
+
+        for (int y = 1; y < height - 1; y++) {
+            for (int x = 1; x < width - 1; x++) {
+                int idx = y * width + x;
+
+                int center = lumArr[idx];
+                int avgNeighbor = (lumArr[(y - 1) * width + x] + lumArr[(y + 1) * width + x] +
+                        lumArr[y * width + (x - 1)] + lumArr[y * width + (x + 1)]) / 4;
+
+                // Sharpen luminance (intensity 2.0)
+                int sharpLum = clamp(center + (int) (2.0f * (center - avgNeighbor)));
+
+                // Desaturate + light contrast boost (1.3x)
+                int val = clamp((int) ((sharpLum - 128) * 1.3f + 128));
+
+                result[idx] = 0xFF000000 | (val << 16) | (val << 8) | val;
+            }
+        }
+
+        // Copy edges
+        for (int x = 0; x < width; x++) {
+            int topLum = lumArr[x];
+            result[x] = 0xFF000000 | (topLum << 16) | (topLum << 8) | topLum;
+            int botLum = lumArr[(height - 1) * width + x];
+            result[(height - 1) * width + x] = 0xFF000000 | (botLum << 16) | (botLum << 8) | botLum;
+        }
+        for (int y = 0; y < height; y++) {
+            int leftLum = lumArr[y * width];
+            result[y * width] = 0xFF000000 | (leftLum << 16) | (leftLum << 8) | leftLum;
+            int rightLum = lumArr[y * width + width - 1];
+            result[y * width + width - 1] = 0xFF000000 | (rightLum << 16) | (rightLum << 8) | rightLum;
+        }
+
+        return result;
+    }
+
+    /**
+     * Large-radius unsharp mask (7x7 box blur) targeting defocus blur.
+     * A bigger radius captures the blur spread and compensates for it.
+     * Combined with desaturation and contrast boost for cleaner binarization.
+     * Best for: out-of-focus barcodes where the camera didn't lock focus properly.
+     */
+    private int[] createDeblurredImage(int[] pixels, int width, int height) {
+        // 7x7 box blur on luminance
+        int radius = 3; // 7x7 = radius 3
+        int[] lumArr = new int[pixels.length];
+        for (int i = 0; i < pixels.length; i++) {
+            int pixel = pixels[i];
+            lumArr[i] = luminance((pixel >> 16) & 0xFF, (pixel >> 8) & 0xFF, pixel & 0xFF);
+        }
+
+        // Compute box blur using integral image for efficiency
+        int[] blurred = boxBlur(lumArr, width, height, radius);
+
+        // Unsharp mask: result = original + intensity * (original - blurred)
+        float intensity = 3.0f;
+        int[] result = new int[pixels.length];
+        for (int i = 0; i < pixels.length; i++) {
+            int sharp = clamp((int) (lumArr[i] + intensity * (lumArr[i] - blurred[i])));
+            // Desaturate + contrast boost (1.6x)
+            int val = clamp((int) ((sharp - 128) * 1.6f + 128));
+            result[i] = 0xFF000000 | (val << 16) | (val << 8) | val;
+        }
+
+        return result;
+    }
+
+    /** Simple box blur using running sums. */
+    private int[] boxBlur(int[] input, int width, int height, int radius) {
+        int[] temp = new int[input.length];
+        int[] output = new int[input.length];
+
+        // Horizontal pass
+        for (int y = 0; y < height; y++) {
+            int sum = 0;
+            int count = 0;
+            for (int x = 0; x < width; x++) {
+                sum += input[y * width + x];
+                count++;
+                if (x > 2 * radius) {
+                    sum -= input[y * width + x - 2 * radius - 1];
+                    count--;
+                }
+                int startX = Math.max(0, x - radius);
+                temp[y * width + x] = sum / count;
+            }
+        }
+
+        // Vertical pass
+        for (int x = 0; x < width; x++) {
+            int sum = 0;
+            int count = 0;
+            for (int y = 0; y < height; y++) {
+                sum += temp[y * width + x];
+                count++;
+                if (y > 2 * radius) {
+                    sum -= temp[(y - 2 * radius - 1) * width + x];
+                    count--;
+                }
+                output[y * width + x] = sum / count;
+            }
+        }
+
+        return output;
+    }
+
+    // ==================== ZXing Decode Helpers ====================
+
+    /**
+     * Primary decode path using HybridBinarizer (adaptive local thresholding).
      */
     private String tryDecode(int[] pixels, int width, int height) {
         try {
             LuminanceSource source = new RGBLuminanceSource(width, height, pixels);
             BinaryBitmap binaryBitmap = new BinaryBitmap(new HybridBinarizer(source));
 
-            // Try PDF417 reader first (most common for driver licenses)
+            // Try PDF417 reader first
             try {
                 Result result = pdf417Reader.decode(binaryBitmap, hints);
                 if (result != null && result.getText() != null) {
-                    // Validate it looks like AAMVA data
                     String text = result.getText();
                     if (isLikelyAAMVAData(text)) {
                         return text;
                     }
                 }
             } catch (NotFoundException ignored) {
-                // PDF417 not found, try multi-format
             }
 
             // Fallback to multi-format reader
@@ -211,7 +544,6 @@ public class BarcodeAnalyzer {
                     }
                 }
             } catch (NotFoundException ignored) {
-                // No barcode found
             }
 
         } catch (Exception e) {
@@ -222,29 +554,45 @@ public class BarcodeAnalyzer {
     }
 
     /**
-     * Checks if the decoded data looks like AAMVA driver license data.
-     * AAMVA data typically starts with "@" and contains "ANSI" identifier.
+     * Alternative decode path using GlobalHistogramBinarizer.
+     * Uses a single global threshold computed from the image histogram.
+     * Can outperform HybridBinarizer in uniformly-lit conditions.
      */
-    private boolean isLikelyAAMVAData(String data) {
-        if (data == null || data.length() < 20) {
-            return false;
+    private String tryDecodeWithGlobalBinarizer(int[] pixels, int width, int height) {
+        try {
+            LuminanceSource source = new RGBLuminanceSource(width, height, pixels);
+            BinaryBitmap binaryBitmap = new BinaryBitmap(new GlobalHistogramBinarizer(source));
+
+            try {
+                Result result = pdf417Reader.decode(binaryBitmap, hints);
+                if (result != null && result.getText() != null) {
+                    String text = result.getText();
+                    if (isLikelyAAMVAData(text)) {
+                        return text;
+                    }
+                }
+            } catch (NotFoundException ignored) {
+            }
+
+            try {
+                Result result = multiFormatReader.decode(binaryBitmap);
+                if (result != null && result.getText() != null) {
+                    String text = result.getText();
+                    if (isLikelyAAMVAData(text)) {
+                        return text;
+                    }
+                }
+            } catch (NotFoundException ignored) {
+            }
+
+        } catch (Exception e) {
+            Log.w(TAG, "Global binarizer decode failed", e);
         }
 
-        // AAMVA data typically starts with @ or contains ANSI header
-        boolean hasStartMarker = data.startsWith("@") ||
-                data.contains("@\n") ||
-                data.contains("@\r");
-
-        boolean hasANSIMarker = data.contains("ANSI");
-
-        // Check for common field codes
-        boolean hasFieldCodes = data.contains("DAQ") || // License number
-                data.contains("DCS") || // Last name
-                data.contains("DAC") || // First name
-                data.contains("DBB");   // Date of birth
-
-        return (hasStartMarker || hasANSIMarker) && hasFieldCodes;
+        return null;
     }
+
+    // ==================== Pixel Helpers ====================
 
     /**
      * Rotates pixel array 90 degrees clockwise.
@@ -259,82 +607,47 @@ public class BarcodeAnalyzer {
         return rotated;
     }
 
-    /**
-     * Rotates pixel array 180 degrees.
-     */
-    private int[] rotatePixels180(int[] pixels, int width, int height) {
-        int[] rotated = new int[pixels.length];
-        for (int i = 0; i < pixels.length; i++) {
-            rotated[pixels.length - 1 - i] = pixels[i];
-        }
-        return rotated;
+    /** Perceived luminance from RGB. */
+    private int luminance(int r, int g, int b) {
+        return (int) (0.299f * r + 0.587f * g + 0.114f * b);
     }
 
-    /**
-     * Rotates pixel array 270 degrees clockwise (90 counter-clockwise).
-     */
-    private int[] rotatePixels270(int[] pixels, int width, int height) {
-        int[] rotated = new int[pixels.length];
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                rotated[(width - 1 - x) * height + y] = pixels[y * width + x];
-            }
-        }
-        return rotated;
-    }
-
-    /**
-     * Enhances contrast of image for better barcode detection.
-     * Uses simple histogram stretching.
-     */
-    private int[] enhanceContrast(int[] pixels, int width, int height) {
-        int[] enhanced = new int[pixels.length];
-
-        // Find min and max luminance
-        int minLum = 255;
-        int maxLum = 0;
-
-        for (int pixel : pixels) {
-            int r = (pixel >> 16) & 0xFF;
-            int g = (pixel >> 8) & 0xFF;
-            int b = pixel & 0xFF;
-            int lum = (int) (0.299 * r + 0.587 * g + 0.114 * b);
-            minLum = Math.min(minLum, lum);
-            maxLum = Math.max(maxLum, lum);
-        }
-
-        // Stretch histogram
-        int range = maxLum - minLum;
-        if (range < 10) {
-            // Image is too uniform, return original
-            return pixels;
-        }
-
-        float scale = 255.0f / range;
-
-        for (int i = 0; i < pixels.length; i++) {
-            int pixel = pixels[i];
-            int a = (pixel >> 24) & 0xFF;
-            int r = (pixel >> 16) & 0xFF;
-            int g = (pixel >> 8) & 0xFF;
-            int b = pixel & 0xFF;
-
-            // Apply contrast stretch to each channel
-            r = clamp((int) ((r - minLum) * scale));
-            g = clamp((int) ((g - minLum) * scale));
-            b = clamp((int) ((b - minLum) * scale));
-
-            enhanced[i] = (a << 24) | (r << 16) | (g << 8) | b;
-        }
-
-        return enhanced;
-    }
-
-    /**
-     * Clamps value to 0-255 range.
-     */
+    /** Clamps value to 0-255 range. */
     private int clamp(int value) {
         return Math.max(0, Math.min(255, value));
+    }
+
+    // ==================== Validation ====================
+
+    /**
+     * Checks if the decoded data looks like AAMVA driver license data.
+     */
+    private boolean isLikelyAAMVAData(String data) {
+        if (data == null || data.length() < 20) {
+            return false;
+        }
+
+        boolean hasStartMarker = data.startsWith("@") ||
+                data.contains("@\n") ||
+                data.contains("@\r");
+
+        boolean hasANSIMarker = data.contains("ANSI");
+
+        boolean hasFieldCodes = data.contains("DAQ") ||
+                data.contains("DCS") ||
+                data.contains("DAC") ||
+                data.contains("DBB");
+
+        return (hasStartMarker || hasANSIMarker) && hasFieldCodes;
+    }
+
+    // ==================== Public Methods ====================
+
+    /**
+     * Resets the strategy rotation index. Call when starting a new scan phase.
+     */
+    public void resetStrategyIndex() {
+        strategyIndex = 0;
     }
 
     /**

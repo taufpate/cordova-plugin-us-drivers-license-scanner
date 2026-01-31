@@ -3,6 +3,12 @@
  *
  * Uses ML Kit Face Detection (on-device) to detect and extract portrait images
  * from driver license photos. Falls back to deterministic cropping if no face is detected.
+ *
+ * Parameters tuned to match iOS Vision framework implementation:
+ * - MIN_FACE_SIZE_RATIO: 0.002 (license faces are small in the camera frame)
+ * - FACE_PADDING_FACTOR: 0.35 (natural portrait crop around detected face)
+ * - Scoring: 70% size / 30% position (larger faces prioritized)
+ * - Expected position: 35%/50% (left-center of frame for US licenses)
  */
 package com.sos.driverslicensescanner;
 
@@ -28,17 +34,21 @@ public class FaceDetectorHelper {
 
     private static final String TAG = "FaceDetectorHelper";
 
-    // Padding factor to add around detected face (as percentage of face size)
-    private static final float FACE_PADDING_FACTOR = 0.3f;
+    // Padding factor around detected face (as percentage of face size)
+    // Matches iOS kFacePaddingFactor = 0.35
+    private static final float FACE_PADDING_FACTOR = 0.35f;
 
-    // Minimum face size relative to image (faces smaller than this are ignored)
-    private static final float MIN_FACE_SIZE_RATIO = 0.05f;
+    // Minimum face size relative to image area.
+    // A face on a license held at scanning distance is typically 0.3-1% of the full
+    // camera frame, so we set a low threshold to avoid rejecting real license faces.
+    // Matches iOS kMinFaceSizeRatio = 0.002
+    private static final float MIN_FACE_SIZE_RATIO = 0.002f;
 
     // Maximum face size relative to image (faces larger than this are likely false positives)
     private static final float MAX_FACE_SIZE_RATIO = 0.7f;
 
     /**
-     * Callback interface for face detection results.
+     * Callback interface for face detection results (from captured photo).
      */
     public interface FaceDetectionCallback {
         void onFaceDetected(Bitmap croppedFace);
@@ -46,9 +56,18 @@ public class FaceDetectorHelper {
         void onFaceDetectionError(String error);
     }
 
+    /**
+     * Callback interface for live video face presence detection.
+     * Used during front scan to trigger auto-capture when a face is visible.
+     */
+    public interface LiveFaceCallback {
+        void onFacePresenceDetected(boolean faceFound);
+    }
+
     private final Context context;
     private final FaceDetectionCallback callback;
     private FaceDetector faceDetector;
+    private FaceDetector liveFaceDetector;
 
     /**
      * Creates a new FaceDetectorHelper.
@@ -60,20 +79,21 @@ public class FaceDetectorHelper {
         this.context = context;
         this.callback = callback;
         initializeDetector();
+        initializeLiveDetector();
     }
 
     /**
-     * Initializes the ML Kit face detector with optimal settings for ID photos.
+     * Initializes the ML Kit face detector with optimal settings for ID photo portraits.
      */
     private void initializeDetector() {
-        // Configure face detector for ID photo portraits
         FaceDetectorOptions options = new FaceDetectorOptions.Builder()
                 .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
                 .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_NONE)
                 .setContourMode(FaceDetectorOptions.CONTOUR_MODE_NONE)
                 .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_NONE)
-                .setMinFaceSize(0.1f) // Minimum face size as proportion of image width
-                .enableTracking() // Enable face tracking for better detection
+                // Matches iOS minFaceSize = 0.05 (proportion of image width)
+                .setMinFaceSize(0.05f)
+                .enableTracking()
                 .build();
 
         faceDetector = FaceDetection.getClient(options);
@@ -81,7 +101,25 @@ public class FaceDetectorHelper {
     }
 
     /**
+     * Initializes a fast face detector for live video frame analysis.
+     * Uses PERFORMANCE_MODE_FAST for lower latency during video scanning.
+     */
+    private void initializeLiveDetector() {
+        FaceDetectorOptions options = new FaceDetectorOptions.Builder()
+                .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+                .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_NONE)
+                .setContourMode(FaceDetectorOptions.CONTOUR_MODE_NONE)
+                .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_NONE)
+                .setMinFaceSize(0.05f)
+                .build();
+
+        liveFaceDetector = FaceDetection.getClient(options);
+        Log.d(TAG, "Live face detector initialized");
+    }
+
+    /**
      * Detects a face in the given bitmap and extracts the portrait.
+     * Used for captured photos (high-quality, accurate mode).
      *
      * @param bitmap The image to analyze (typically the front of a driver license)
      */
@@ -92,10 +130,8 @@ public class FaceDetectorHelper {
             return;
         }
 
-        // Create input image for ML Kit
         InputImage inputImage = InputImage.fromBitmap(bitmap, 0);
 
-        // Process the image
         faceDetector.process(inputImage)
                 .addOnSuccessListener(faces -> handleDetectionResult(bitmap, faces))
                 .addOnFailureListener(e -> {
@@ -105,7 +141,37 @@ public class FaceDetectorHelper {
     }
 
     /**
-     * Handles the face detection result.
+     * Checks for face presence in a live video frame.
+     * Uses fast detection mode suitable for real-time video analysis.
+     * Does not extract/crop the face — only reports presence.
+     *
+     * @param bitmap Video frame to analyze
+     * @param liveFaceCallback Callback for face presence result
+     */
+    public void checkForFacePresence(Bitmap bitmap, LiveFaceCallback liveFaceCallback) {
+        if (bitmap == null || bitmap.isRecycled()) {
+            liveFaceCallback.onFacePresenceDetected(false);
+            return;
+        }
+
+        InputImage inputImage = InputImage.fromBitmap(bitmap, 0);
+
+        liveFaceDetector.process(inputImage)
+                .addOnSuccessListener(faces -> {
+                    boolean found = faces != null && !faces.isEmpty();
+                    if (found) {
+                        Log.d(TAG, "Live face detected (" + faces.size() + " face(s))");
+                    }
+                    liveFaceCallback.onFacePresenceDetected(found);
+                })
+                .addOnFailureListener(e -> {
+                    Log.w(TAG, "Live face detection failed", e);
+                    liveFaceCallback.onFacePresenceDetected(false);
+                });
+    }
+
+    /**
+     * Handles the face detection result from captured photo.
      */
     private void handleDetectionResult(Bitmap originalBitmap, List<Face> faces) {
         if (faces == null || faces.isEmpty()) {
@@ -116,7 +182,6 @@ public class FaceDetectorHelper {
 
         Log.d(TAG, "Detected " + faces.size() + " face(s)");
 
-        // Find the best face (largest that's within expected size range for ID photos)
         Face bestFace = findBestFace(originalBitmap, faces);
 
         if (bestFace == null) {
@@ -125,7 +190,6 @@ public class FaceDetectorHelper {
             return;
         }
 
-        // Extract and crop the face region
         try {
             Bitmap croppedFace = extractFaceRegion(originalBitmap, bestFace);
             if (croppedFace != null) {
@@ -142,7 +206,8 @@ public class FaceDetectorHelper {
 
     /**
      * Finds the best face candidate from the detected faces.
-     * For driver licenses, we expect one prominent face in a specific location.
+     * Scoring: 70% size + 30% position (matches iOS implementation).
+     * US licenses typically have the photo on the left side.
      */
     private Face findBestFace(Bitmap bitmap, List<Face> faces) {
         int imageWidth = bitmap.getWidth();
@@ -163,15 +228,13 @@ public class FaceDetectorHelper {
                 continue;
             }
 
-            // Calculate a score based on:
-            // 1. Size (larger is better for ID photos)
-            // 2. Position (left side of image is typical for US licenses)
+            // Size score (70% weight) — larger faces prioritized
             float sizeScore = faceArea / imageArea;
 
-            // US driver licenses typically have the photo on the left side
-            // Score based on how close to expected position
-            float expectedCenterX = imageWidth * 0.25f; // Photo usually in left quarter
-            float expectedCenterY = imageHeight * 0.4f; // Upper portion
+            // Position score (30% weight) — prefer left-center area
+            // Matches iOS: expected position at 35%/50% of image
+            float expectedCenterX = imageWidth * 0.35f;
+            float expectedCenterY = imageHeight * 0.50f;
             float actualCenterX = bounds.centerX();
             float actualCenterY = bounds.centerY();
 
@@ -179,9 +242,13 @@ public class FaceDetectorHelper {
                     Math.abs(actualCenterX - expectedCenterX) / imageWidth +
                             Math.abs(actualCenterY - expectedCenterY) / imageHeight
             ) / 2;
+            positionScore = Math.max(0, positionScore);
 
-            // Combined score
-            float totalScore = sizeScore * 0.6f + positionScore * 0.4f;
+            // Combined score: 70/30 split (matches iOS)
+            float totalScore = sizeScore * 0.7f + positionScore * 0.3f;
+
+            Log.d(TAG, String.format("Face score: size=%.4f pos=%.4f total=%.4f (center=%.0f,%.0f)",
+                    sizeScore, positionScore, totalScore, actualCenterX, actualCenterY));
 
             if (totalScore > bestScore) {
                 bestScore = totalScore;
@@ -193,22 +260,19 @@ public class FaceDetectorHelper {
     }
 
     /**
-     * Extracts the face region from the image with appropriate padding.
+     * Extracts the face region from the image with 35% padding.
      */
     private Bitmap extractFaceRegion(Bitmap bitmap, Face face) {
         Rect bounds = face.getBoundingBox();
 
-        // Add padding around the face
         int paddingX = (int) (bounds.width() * FACE_PADDING_FACTOR);
         int paddingY = (int) (bounds.height() * FACE_PADDING_FACTOR);
 
-        // Calculate crop region with padding
         int left = Math.max(0, bounds.left - paddingX);
         int top = Math.max(0, bounds.top - paddingY);
         int right = Math.min(bitmap.getWidth(), bounds.right + paddingX);
         int bottom = Math.min(bitmap.getHeight(), bounds.bottom + paddingY);
 
-        // Ensure we have a valid region
         int width = right - left;
         int height = bottom - top;
 
@@ -217,7 +281,6 @@ public class FaceDetectorHelper {
             return null;
         }
 
-        // Crop the bitmap
         try {
             return Bitmap.createBitmap(bitmap, left, top, width, height);
         } catch (Exception e) {
@@ -229,6 +292,7 @@ public class FaceDetectorHelper {
     /**
      * Performs deterministic cropping based on standard driver license layout.
      * Used as fallback when face detection fails.
+     * Percentages match iOS implementation: Y=12%, W=26%, H=55%.
      *
      * @param bitmap The front of the driver license
      * @return Cropped portrait region
@@ -241,19 +305,12 @@ public class FaceDetectorHelper {
         int width = bitmap.getWidth();
         int height = bitmap.getHeight();
 
-        // US driver license typical portrait location:
-        // - Left side of the card
-        // - Upper portion
-        // - Approximately 25-30% of card width
-        // - Approximately 40-50% of card height
+        // Matches iOS: 3% left, 12% top, 26% width, 55% height
+        int portraitLeft = (int) (width * 0.03);
+        int portraitTop = (int) (height * 0.12);
+        int portraitWidth = (int) (width * 0.26);
+        int portraitHeight = (int) (height * 0.55);
 
-        // Define the expected portrait region
-        int portraitLeft = (int) (width * 0.03); // 3% from left edge
-        int portraitTop = (int) (height * 0.15); // 15% from top
-        int portraitWidth = (int) (width * 0.28); // 28% of card width
-        int portraitHeight = (int) (height * 0.50); // 50% of card height
-
-        // Ensure bounds are valid
         portraitLeft = Math.max(0, portraitLeft);
         portraitTop = Math.max(0, portraitTop);
         portraitWidth = Math.min(portraitWidth, width - portraitLeft);
@@ -273,13 +330,18 @@ public class FaceDetectorHelper {
     }
 
     /**
-     * Releases resources used by the face detector.
+     * Releases resources used by the face detectors.
      */
     public void shutdown() {
         if (faceDetector != null) {
             faceDetector.close();
             faceDetector = null;
             Log.d(TAG, "Face detector shut down");
+        }
+        if (liveFaceDetector != null) {
+            liveFaceDetector.close();
+            liveFaceDetector = null;
+            Log.d(TAG, "Live face detector shut down");
         }
     }
 }

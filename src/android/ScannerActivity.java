@@ -3,6 +3,15 @@
  *
  * Activity that handles the guided driver license scanning flow.
  * Implements a two-step scan process: front → flip → back.
+ *
+ * Front scan: Uses live video face detection to auto-capture when a face is visible.
+ *   - Checks every 5th delivered video frame for face presence
+ *   - Auto-captures when face detected (frontCaptureTriggered guard)
+ *   - Falls back to capture after 10 seconds if no face found
+ *
+ * Back scan: Reads PDF417 barcode from video frames using strategy rotation.
+ *   - Auto-torch activates after ~3s if barcode not detected
+ *   - Resets BarcodeAnalyzer strategy index for fresh scan
  */
 package com.sos.driverslicensescanner;
 
@@ -44,6 +53,12 @@ public class ScannerActivity extends AppCompatActivity implements
 
     private static final String TAG = "ScannerActivity";
 
+    // Face detection runs every Nth delivered video frame (matches iOS kFaceCheckInterval = 5)
+    private static final int FACE_CHECK_INTERVAL = 5;
+
+    // If no face is found within this time, capture anyway (matches iOS kFaceDetectionFallbackTimeout = 10s)
+    private static final long FACE_FALLBACK_TIMEOUT_MS = 10000;
+
     // Scan flow states
     private enum ScanState {
         SCANNING_FRONT,
@@ -84,6 +99,10 @@ public class ScannerActivity extends AppCompatActivity implements
     private ScanState currentState = ScanState.SCANNING_FRONT;
     private boolean isFlashOn = false;
 
+    // Face detection state (front scan) — matches iOS ScannerViewController
+    private boolean frontCaptureTriggered = false;
+    private int faceCheckCounter = 0;
+
     // Scan results storage
     private Bitmap frontImage;
     private Bitmap backImage;
@@ -92,8 +111,9 @@ public class ScannerActivity extends AppCompatActivity implements
     private String backRawData;
     private JSONObject parsedFields;
 
-    // Timeout handler
+    // Timeout handlers
     private Runnable timeoutRunnable;
+    private Runnable faceFallbackRunnable;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -117,7 +137,6 @@ public class ScannerActivity extends AppCompatActivity implements
 
     /**
      * Initialize view references using resource name lookup.
-     * This is necessary for Cordova plugins where R class may not be directly accessible.
      */
     private void initializeViews() {
         previewView = findViewById(getResId("camera_preview"));
@@ -130,7 +149,6 @@ public class ScannerActivity extends AppCompatActivity implements
         flipIcon = findViewById(getResId("flip_icon"));
         flipInstructionContainer = findViewById(getResId("flip_instruction_container"));
 
-        // Set up button listeners
         cancelButton.setOnClickListener(v -> cancelScan());
         flashButton.setOnClickListener(v -> toggleFlash());
     }
@@ -174,7 +192,6 @@ public class ScannerActivity extends AppCompatActivity implements
         aamvaParser = new AAMVAParser();
         faceDetector = new FaceDetectorHelper(this, this);
 
-        // Initialize camera manager
         cameraManager = new CameraManager(this, previewView, this);
     }
 
@@ -185,7 +202,7 @@ public class ScannerActivity extends AppCompatActivity implements
         Log.d(TAG, "Transitioning from " + currentState + " to " + newState);
         currentState = newState;
 
-        // Cancel any pending timeout
+        // Cancel any pending timeouts
         cancelTimeout();
 
         mainHandler.post(() -> updateUIForState(newState));
@@ -212,7 +229,6 @@ public class ScannerActivity extends AppCompatActivity implements
                 break;
 
             case ERROR:
-                // Error handled separately with message
                 break;
         }
     }
@@ -221,7 +237,6 @@ public class ScannerActivity extends AppCompatActivity implements
      * Updates UI elements based on current state.
      */
     private void updateUIForState(ScanState state) {
-        // Reset visibility
         progressBar.setVisibility(View.GONE);
         flipInstructionContainer.setVisibility(View.GONE);
         previewView.setVisibility(View.VISIBLE);
@@ -230,7 +245,7 @@ public class ScannerActivity extends AppCompatActivity implements
         switch (state) {
             case SCANNING_FRONT:
                 instructionText.setText("Position the FRONT of your driver license");
-                statusText.setText("Align the license within the frame");
+                statusText.setText("Looking for license photo...");
                 setOverlayColor(Color.WHITE);
                 break;
 
@@ -245,7 +260,7 @@ public class ScannerActivity extends AppCompatActivity implements
 
             case SCANNING_BACK:
                 instructionText.setText("Position the BACK of your driver license");
-                statusText.setText("Align the barcode within the frame");
+                statusText.setText("Scanning barcode...");
                 setOverlayColor(Color.WHITE);
                 break;
 
@@ -277,25 +292,41 @@ public class ScannerActivity extends AppCompatActivity implements
             overlayFrame.setBackgroundResource(
                     getResources().getIdentifier("scan_overlay", "drawable", getPackageName())
             );
-            // The drawable handles the color through state, but we can tint if needed
         }
     }
 
     /**
      * Starts the front side scanning process.
+     * Uses face detection mode to auto-capture when a face is visible in video frames.
+     * Matches iOS: startCameraWithBarcodeScanning:YES (enables video frames for face detection).
      */
     private void startFrontScan() {
-        Log.d(TAG, "Starting front scan");
+        Log.d(TAG, "Starting front scan with face detection");
 
-        // Start camera for image capture (not barcode scanning)
-        cameraManager.startCamera(false);
+        frontCaptureTriggered = false;
+        faceCheckCounter = 0;
 
-        // Set timeout for front scan
+        // Start camera with face detection mode (delivers video frames for face checking)
+        cameraManager.startCamera(false, true);
+
+        // Overall timeout: fail if front scan takes too long
         startTimeout(() -> {
             if (currentState == ScanState.SCANNING_FRONT) {
                 finishWithError("SCAN_TIMEOUT", "Front scan timed out. Please try again.");
             }
         });
+
+        // Face detection fallback: if no face found after 10 seconds, capture anyway
+        // Matches iOS kFaceDetectionFallbackTimeout = 10.0
+        faceFallbackRunnable = () -> {
+            if (currentState == ScanState.SCANNING_FRONT && !frontCaptureTriggered) {
+                Log.d(TAG, "Face fallback: capturing without face detection");
+                frontCaptureTriggered = true;
+                statusText.setText("Capturing...");
+                cameraManager.captureImage();
+            }
+        };
+        mainHandler.postDelayed(faceFallbackRunnable, FACE_FALLBACK_TIMEOUT_MS);
     }
 
     /**
@@ -312,19 +343,23 @@ public class ScannerActivity extends AppCompatActivity implements
             vibrate();
         }
 
-        // Auto-transition to back scan after delay
+        // Auto-transition to back scan after 2.5s delay
         mainHandler.postDelayed(() -> {
             if (currentState == ScanState.FLIP_INSTRUCTION) {
                 transitionToState(ScanState.SCANNING_BACK);
             }
-        }, 2500); // Show flip instruction for 2.5 seconds
+        }, 2500);
     }
 
     /**
      * Starts the back side scanning process (barcode scanning).
+     * Resets BarcodeAnalyzer strategy index for a fresh scan cycle.
      */
     private void startBackScan() {
         Log.d(TAG, "Starting back scan");
+
+        // Reset barcode analyzer strategy rotation for fresh scan
+        cameraManager.resetBarcodeAnalyzer();
 
         // Start camera with barcode scanning enabled
         cameraManager.startCamera(true);
@@ -356,8 +391,6 @@ public class ScannerActivity extends AppCompatActivity implements
 
                 // Extract portrait if requested and face was detected
                 if (extractPortrait && frontImage != null && portraitImage == null) {
-                    // Face detection already happened during front scan
-                    // If no face was found, use deterministic crop
                     portraitImage = ImageUtils.extractPortraitDeterministic(frontImage);
                 }
 
@@ -383,21 +416,17 @@ public class ScannerActivity extends AppCompatActivity implements
     private JSONObject buildScanResult() throws JSONException {
         JSONObject result = new JSONObject();
 
-        // Raw data
         result.put("frontRawData", frontRawData);
         result.put("backRawData", backRawData);
 
-        // Parsed fields
         result.put("parsedFields", parsedFields != null ? parsedFields : new JSONObject());
 
-        // Portrait image
         if (portraitImage != null) {
             result.put("portraitImageBase64", ImageUtils.bitmapToBase64(portraitImage, "JPEG", 85));
         } else {
             result.put("portraitImageBase64", "");
         }
 
-        // Full images if requested
         if (captureFullImages) {
             if (frontImage != null) {
                 result.put("fullFrontImageBase64", ImageUtils.bitmapToBase64(frontImage, "JPEG", 85));
@@ -461,11 +490,56 @@ public class ScannerActivity extends AppCompatActivity implements
         finishWithError(errorCode, errorMessage);
     }
 
+    /**
+     * Called with each delivered video frame during face detection mode.
+     * Checks every 5th frame for face presence and auto-captures when found.
+     * Matches iOS ScannerViewController.cameraManager:didReceiveSampleBuffer:
+     */
+    @Override
+    public void onVideoFrameAvailable(Bitmap frame) {
+        if (currentState != ScanState.SCANNING_FRONT || frontCaptureTriggered) {
+            if (frame != null && !frame.isRecycled()) {
+                frame.recycle();
+            }
+            return;
+        }
+
+        // Throttle face checks: every 5th delivered frame (matches iOS kFaceCheckInterval = 5)
+        faceCheckCounter++;
+        if (faceCheckCounter % FACE_CHECK_INTERVAL != 0) {
+            if (frame != null && !frame.isRecycled()) {
+                frame.recycle();
+            }
+            return;
+        }
+
+        // Run face detection on the video frame
+        faceDetector.checkForFacePresence(frame, faceFound -> {
+            // Recycle the frame now that detection is complete
+            if (frame != null && !frame.isRecycled()) {
+                frame.recycle();
+            }
+
+            if (faceFound && currentState == ScanState.SCANNING_FRONT && !frontCaptureTriggered) {
+                Log.d(TAG, "Face detected in video frame — auto-capturing");
+
+                frontCaptureTriggered = true;
+
+                mainHandler.post(() -> {
+                    if (currentState == ScanState.SCANNING_FRONT) {
+                        statusText.setText("Face detected! Capturing...");
+                        cameraManager.captureImage();
+                    }
+                });
+            }
+        });
+    }
+
     // ==================== FaceDetectorHelper.FaceDetectionCallback Implementation ====================
 
     @Override
     public void onFaceDetected(Bitmap croppedFace) {
-        Log.d(TAG, "Face detected and cropped");
+        Log.d(TAG, "Face detected and cropped from captured photo");
         portraitImage = croppedFace;
 
         mainHandler.post(() -> {
@@ -477,11 +551,10 @@ public class ScannerActivity extends AppCompatActivity implements
 
     @Override
     public void onNoFaceDetected() {
-        Log.d(TAG, "No face detected, will use deterministic crop");
+        Log.d(TAG, "No face in captured photo, will use deterministic crop");
 
         mainHandler.post(() -> {
             if (currentState == ScanState.SCANNING_FRONT) {
-                // Continue without face-based portrait, will use deterministic crop
                 transitionToState(ScanState.FLIP_INSTRUCTION);
             }
         });
@@ -493,7 +566,6 @@ public class ScannerActivity extends AppCompatActivity implements
 
         mainHandler.post(() -> {
             if (currentState == ScanState.SCANNING_FRONT) {
-                // Continue without portrait
                 transitionToState(ScanState.FLIP_INSTRUCTION);
             }
         });
@@ -511,12 +583,16 @@ public class ScannerActivity extends AppCompatActivity implements
     }
 
     /**
-     * Cancels any pending timeout.
+     * Cancels any pending timeout and face fallback timer.
      */
     private void cancelTimeout() {
         if (timeoutRunnable != null) {
             mainHandler.removeCallbacks(timeoutRunnable);
             timeoutRunnable = null;
+        }
+        if (faceFallbackRunnable != null) {
+            mainHandler.removeCallbacks(faceFallbackRunnable);
+            faceFallbackRunnable = null;
         }
     }
 
@@ -600,8 +676,10 @@ public class ScannerActivity extends AppCompatActivity implements
     @Override
     protected void onResume() {
         super.onResume();
-        if (currentState == ScanState.SCANNING_FRONT || currentState == ScanState.SCANNING_BACK) {
-            cameraManager.startCamera(currentState == ScanState.SCANNING_BACK);
+        if (currentState == ScanState.SCANNING_FRONT) {
+            cameraManager.startCamera(false, true);
+        } else if (currentState == ScanState.SCANNING_BACK) {
+            cameraManager.startCamera(true);
         }
     }
 

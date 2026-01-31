@@ -1,28 +1,56 @@
 /**
  * BarcodeDecoder.m
  *
- * PDF417 barcode decoder implementation using ZXingObjC.
- * Fixed: CGImage is extracted on the calling thread (video queue) while the
+ * PDF417 barcode decoder using ZXingObjC with strategy-rotation image processing.
+ *
+ * To avoid starving the decoder of fresh frames, only TWO strategies are
+ * tried per frame: the original (HybridBinarizer) plus ONE rotating enhanced
+ * strategy. The enhanced strategies cycle across consecutive frames:
+ *
+ *   Frame N+0: original + GlobalHistogramBinarizer
+ *   Frame N+1: original + sharpened-contrast
+ *   Frame N+2: original + high-contrast-grayscale
+ *   Frame N+3: original + anti-reflection
+ *   Frame N+4: original + rotated-90°
+ *   Frame N+5: original + luminance-sharpen (blur recovery)
+ *   Frame N+6: original + downscale-50% (blur averaging)
+ *   Frame N+7: original + large-radius deblur
+ *   Frame N+8: (cycle repeats)
+ *
+ * This keeps per-frame processing ≈25ms instead of ≈80ms when all ran,
+ * preventing the `isProcessing` flag from blocking fresh frames too long.
+ *
+ * CGImage is extracted on the calling thread (video queue) while the
  * CMSampleBufferRef is still valid, then dispatched to the decode queue.
  */
 
 #import "BarcodeDecoder.h"
 #import <ZXingObjC/ZXingObjC.h>
+#import <CoreImage/CoreImage.h>
 
 // Debounce interval to avoid reporting same barcode repeatedly
 static NSTimeInterval const kDebounceInterval = 1.0;
 
-// Maximum dimension for barcode analysis (smaller = less memory, still enough for PDF417)
-static CGFloat const kMaxAnalysisDimension = 720.0;
+// Maximum dimension for barcode analysis — matches the 1920x1080 camera preset
+static CGFloat const kMaxAnalysisDimension = 1080.0;
+
+// Number of enhanced strategies to rotate through (excludes the original which always runs).
+// 8 strategies = full cycle in ~1.1s at 15 delivered frames/sec with skip=2
+static NSInteger const kEnhancedStrategyCount = 8;
 
 @interface BarcodeDecoder ()
 
 @property (nonatomic, strong) ZXMultiFormatReader *reader;
 @property (nonatomic, strong) ZXDecodeHints *decodeHints;
 @property (nonatomic, strong) dispatch_queue_t decodeQueue;
+@property (nonatomic, strong) CIContext *ciContext;
 @property (nonatomic, assign) BOOL isProcessing;
 @property (nonatomic, strong) NSString *lastDecodedData;
 @property (nonatomic, strong) NSDate *lastDecodeTime;
+
+// Strategy rotation index — cycles 0..4 across frames so each frame only
+// runs the original + ONE enhanced strategy instead of all 6.
+@property (nonatomic, assign) NSInteger strategyIndex;
 
 @end
 
@@ -35,6 +63,11 @@ static CGFloat const kMaxAnalysisDimension = 720.0;
     if (self) {
         _decodeQueue = dispatch_queue_create("com.sos.barcode.decode", DISPATCH_QUEUE_SERIAL);
         _isProcessing = NO;
+
+        _strategyIndex = 0;
+
+        // GPU-accelerated Core Image context, reused for every frame
+        _ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
 
         [self setupReader];
     }
@@ -56,7 +89,7 @@ static CGFloat const kMaxAnalysisDimension = 720.0;
 
     self.reader = [ZXMultiFormatReader reader];
 
-    NSLog(@"[BarcodeDecoder] Initialized with PDF417 reader");
+    NSLog(@"[BarcodeDecoder] Initialized with PDF417 reader + multi-strategy pipeline");
 }
 
 #pragma mark - Public Methods
@@ -96,7 +129,6 @@ static CGFloat const kMaxAnalysisDimension = 720.0;
 
     dispatch_async(self.decodeQueue, ^{
         @autoreleasepool {
-            // Scale down before processing
             UIImage *scaled = [self scaleImageForAnalysis:image];
             [self processImage:scaled];
             self.isProcessing = NO;
@@ -108,6 +140,7 @@ static CGFloat const kMaxAnalysisDimension = 720.0;
     self.lastDecodedData = nil;
     self.lastDecodeTime = nil;
     self.isProcessing = NO;
+    self.strategyIndex = 0;
 }
 
 #pragma mark - Buffer → CGImage Extraction (called on video queue)
@@ -153,88 +186,325 @@ static CGFloat const kMaxAnalysisDimension = 720.0;
     return cgImage; // Caller must CGImageRelease
 }
 
-#pragma mark - Decode CGImage (called on decode queue)
+#pragma mark - Multi-Strategy Decode (called on decode queue)
 
 - (void)decodeCGImageAndReport:(CGImageRef)cgImage {
     if (!cgImage) {
         return;
     }
 
-    size_t imgW = CGImageGetWidth(cgImage);
-    size_t imgH = CGImageGetHeight(cgImage);
-    NSLog(@"[BarcodeDecoder] Analyzing frame %zux%zu", imgW, imgH);
+    NSString *result = nil;
+    NSString *strategy = nil;
 
-    // Try original orientation
-    NSString *result = [self decodeFromCGImage:cgImage];
-
-    // Try 90-degree rotation if original fails (portrait vs landscape mismatch)
-    if (!result) {
-        CGImageRef rotated90 = [self createRotatedCGImage:cgImage degrees:90];
-        if (rotated90) {
-            result = [self decodeFromCGImage:rotated90];
-            CGImageRelease(rotated90);
-        }
-    }
-
-    // Try 270-degree rotation as last resort
-    if (!result) {
-        CGImageRef rotated270 = [self createRotatedCGImage:cgImage degrees:270];
-        if (rotated270) {
-            result = [self decodeFromCGImage:rotated270];
-            CGImageRelease(rotated270);
-        }
-    }
-
+    // ---- Always try the original image first (HybridBinarizer) ----
+    result = [self decodeFromCGImage:cgImage];
     if (result) {
-        NSLog(@"[BarcodeDecoder] ZXing decoded data length=%lu, first 60: %@",
-              (unsigned long)result.length,
-              [result substringToIndex:MIN(60, result.length)]);
+        strategy = @"original";
+    }
+
+    // ---- If original failed, try ONE rotating enhanced strategy ----
+    // This avoids the ~80ms cost of trying all 5 enhanced strategies
+    // every frame, which was blocking fresh frames and causing "stuck".
+    if (!result) {
+        NSInteger idx = self.strategyIndex % kEnhancedStrategyCount;
+        self.strategyIndex++;
+
+        switch (idx) {
+            case 0: {
+                // GlobalHistogramBinarizer — different thresholding
+                result = [self decodeFromCGImageWithGlobalBinarizer:cgImage];
+                if (result) strategy = @"global-histogram";
+                break;
+            }
+            case 1: {
+                // Sharpened + contrast + desaturated
+                CGImageRef enhanced = [self createSharpenedContrastImage:cgImage];
+                if (enhanced) {
+                    result = [self decodeFromCGImage:enhanced];
+                    if (result) strategy = @"sharpened-contrast";
+                    CGImageRelease(enhanced);
+                }
+                break;
+            }
+            case 2: {
+                // High-contrast grayscale (near-binary)
+                CGImageRef grayscale = [self createHighContrastGrayscaleImage:cgImage];
+                if (grayscale) {
+                    result = [self decodeFromCGImage:grayscale];
+                    if (result) strategy = @"high-contrast-grayscale";
+                    CGImageRelease(grayscale);
+                }
+                break;
+            }
+            case 3: {
+                // Anti-reflection
+                CGImageRef antiReflect = [self createAntiReflectionImage:cgImage];
+                if (antiReflect) {
+                    result = [self decodeFromCGImage:antiReflect];
+                    if (result) strategy = @"anti-reflection";
+                    CGImageRelease(antiReflect);
+                }
+                break;
+            }
+            case 4: {
+                // 90° rotation fallback
+                CGImageRef rotated = [self createRotatedCGImage:cgImage degrees:90];
+                if (rotated) {
+                    result = [self decodeFromCGImage:rotated];
+                    if (result) strategy = @"rotated-90";
+                    CGImageRelease(rotated);
+                }
+                break;
+            }
+            case 5: {
+                // Luminance-only sharpening — recovers edges without color artifacts
+                CGImageRef sharpLum = [self createLuminanceSharpenedImage:cgImage];
+                if (sharpLum) {
+                    result = [self decodeFromCGImage:sharpLum];
+                    if (result) strategy = @"luminance-sharpen";
+                    CGImageRelease(sharpLum);
+                }
+                break;
+            }
+            case 6: {
+                // Downscale 50% — pixel averaging smooths out blur/noise,
+                // ZXing can decode better from a smaller, cleaner image
+                CGImageRef downscaled = [self createDownscaledImage:cgImage scale:0.5];
+                if (downscaled) {
+                    result = [self decodeFromCGImage:downscaled];
+                    if (result) strategy = @"downscale-50";
+                    CGImageRelease(downscaled);
+                }
+                break;
+            }
+            case 7: {
+                // Large-radius deblur — specifically targets defocus blur
+                CGImageRef deblurred = [self createDeblurredImage:cgImage];
+                if (deblurred) {
+                    result = [self decodeFromCGImage:deblurred];
+                    if (result) strategy = @"deblur";
+                    CGImageRelease(deblurred);
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    // Report
+    if (result) {
+        NSLog(@"[BarcodeDecoder] Decoded via strategy '%@', length=%lu",
+              strategy, (unsigned long)result.length);
 
         if ([self isValidAAMVAData:result]) {
-            NSLog(@"[BarcodeDecoder] AAMVA validation passed");
             [self handleDecodedData:result];
         } else {
-            NSLog(@"[BarcodeDecoder] AAMVA validation FAILED for decoded data");
+            NSLog(@"[BarcodeDecoder] AAMVA validation FAILED for strategy '%@'", strategy);
         }
     }
 }
 
-#pragma mark - Image Processing
+#pragma mark - Core Image Processing Strategies
 
-- (UIImage *)scaleImageForAnalysis:(UIImage *)image {
-    CGFloat width = image.size.width;
-    CGFloat height = image.size.height;
+/**
+ * Sharpens barcode module edges (unsharp mask), increases contrast,
+ * and removes colour information so the binarizer sees cleaner edges.
+ * Best for: slightly worn or slightly blurry barcodes.
+ */
+- (CGImageRef)createSharpenedContrastImage:(CGImageRef)source {
+    if (!source) return NULL;
 
-    if (width <= kMaxAnalysisDimension && height <= kMaxAnalysisDimension) {
-        return image;
-    }
+    CIImage *ciImage = [CIImage imageWithCGImage:source];
 
-    CGFloat scale = MIN(kMaxAnalysisDimension / width, kMaxAnalysisDimension / height);
-    CGSize newSize = CGSizeMake(width * scale, height * scale);
+    // Unsharp mask — emphasises barcode module boundaries
+    CIFilter *sharpen = [CIFilter filterWithName:@"CIUnsharpMask"];
+    [sharpen setValue:ciImage forKey:kCIInputImageKey];
+    [sharpen setValue:@(2.5) forKey:@"inputIntensity"];
+    [sharpen setValue:@(1.5) forKey:@"inputRadius"];
 
-    UIGraphicsBeginImageContextWithOptions(newSize, YES, 1.0);
-    [image drawInRect:CGRectMake(0, 0, newSize.width, newSize.height)];
-    UIImage *scaledImage = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
+    CIImage *sharpened = sharpen.outputImage;
+    if (!sharpened) return NULL;
 
-    return scaledImage;
+    // Increase contrast + full desaturation
+    CIFilter *controls = [CIFilter filterWithName:@"CIColorControls"];
+    [controls setValue:sharpened forKey:kCIInputImageKey];
+    [controls setValue:@(0.5) forKey:@"inputContrast"];
+    [controls setValue:@(0.0) forKey:@"inputBrightness"];
+    [controls setValue:@(0.0) forKey:@"inputSaturation"];
+
+    CIImage *output = controls.outputImage;
+    if (!output) return NULL;
+
+    return [self.ciContext createCGImage:output fromRect:output.extent];
 }
 
-- (void)processImage:(UIImage *)image {
-    // Try original orientation
-    NSString *result = [self decodeFromImage:image];
+/**
+ * Full grayscale with aggressive contrast — pushes the image toward binary.
+ * Best for: heavily worn, faded, or low-contrast barcodes where modules
+ * are barely distinguishable from the background.
+ */
+- (CGImageRef)createHighContrastGrayscaleImage:(CGImageRef)source {
+    if (!source) return NULL;
 
-    // Only try 90-degree rotation (covers the most common alternative orientation)
-    if (!result) {
-        UIImage *rotated90 = [self rotateImage:image byDegrees:90];
-        result = [self decodeFromImage:rotated90];
-    }
+    CIImage *ciImage = [CIImage imageWithCGImage:source];
 
-    if (result && [self isValidAAMVAData:result]) {
-        [self handleDecodedData:result];
-    }
+    // Full desaturation + heavy contrast + slight brightness lift
+    CIFilter *controls = [CIFilter filterWithName:@"CIColorControls"];
+    [controls setValue:ciImage forKey:kCIInputImageKey];
+    [controls setValue:@(1.5) forKey:@"inputContrast"];
+    [controls setValue:@(0.05) forKey:@"inputBrightness"];
+    [controls setValue:@(-1.0) forKey:@"inputSaturation"];
+
+    CIImage *output = controls.outputImage;
+    if (!output) return NULL;
+
+    return [self.ciContext createCGImage:output fromRect:output.extent];
 }
 
+/**
+ * Counteracts reflections and glare by compressing highlights and
+ * lifting shadows, then boosting contrast on the balanced image.
+ * Best for: shiny/laminated licenses with specular reflections
+ * washing out parts of the barcode.
+ */
+- (CGImageRef)createAntiReflectionImage:(CGImageRef)source {
+    if (!source) return NULL;
+
+    CIImage *ciImage = [CIImage imageWithCGImage:source];
+
+    // Tame highlights (reflections) and recover shadow detail
+    CIFilter *hlShadow = [CIFilter filterWithName:@"CIHighlightShadowAdjust"];
+    [hlShadow setValue:ciImage forKey:kCIInputImageKey];
+    [hlShadow setValue:@(-0.8) forKey:@"inputHighlightAmount"];
+    [hlShadow setValue:@(0.6) forKey:@"inputShadowAmount"];
+
+    CIImage *balanced = hlShadow.outputImage;
+    if (!balanced) return NULL;
+
+    // Boost contrast + desaturate on the now-balanced image
+    CIFilter *controls = [CIFilter filterWithName:@"CIColorControls"];
+    [controls setValue:balanced forKey:kCIInputImageKey];
+    [controls setValue:@(0.8) forKey:@"inputContrast"];
+    [controls setValue:@(0.0) forKey:@"inputBrightness"];
+    [controls setValue:@(0.0) forKey:@"inputSaturation"];
+
+    CIImage *output = controls.outputImage;
+    if (!output) return NULL;
+
+    return [self.ciContext createCGImage:output fromRect:output.extent];
+}
+
+/**
+ * Luminance-only sharpening using CISharpenLuminance.
+ * Unlike CIUnsharpMask, this only sharpens the brightness channel,
+ * avoiding colour artifacts that can confuse the binarizer.
+ * Best for: moderate blur where barcode edges are soft but visible.
+ */
+- (CGImageRef)createLuminanceSharpenedImage:(CGImageRef)source {
+    if (!source) return NULL;
+
+    CIImage *ciImage = [CIImage imageWithCGImage:source];
+
+    CIFilter *sharpen = [CIFilter filterWithName:@"CISharpenLuminance"];
+    [sharpen setValue:ciImage forKey:kCIInputImageKey];
+    [sharpen setValue:@(2.0) forKey:@"inputSharpness"];
+
+    CIImage *sharpened = sharpen.outputImage;
+    if (!sharpened) return NULL;
+
+    // Desaturate + light contrast for cleaner binarization
+    CIFilter *controls = [CIFilter filterWithName:@"CIColorControls"];
+    [controls setValue:sharpened forKey:kCIInputImageKey];
+    [controls setValue:@(0.3) forKey:@"inputContrast"];
+    [controls setValue:@(0.0) forKey:@"inputSaturation"];
+
+    CIImage *output = controls.outputImage;
+    if (!output) return NULL;
+
+    return [self.ciContext createCGImage:output fromRect:output.extent];
+}
+
+/**
+ * Downscales the image by the given factor using high-quality interpolation.
+ * Downscaling averages neighbouring pixels, which smooths out blur and noise
+ * at the subpixel level. ZXing's binarizer can sometimes decode a smaller,
+ * cleaner image where it fails on the full-resolution blurry one.
+ * Best for: motion blur and camera shake.
+ */
+- (CGImageRef)createDownscaledImage:(CGImageRef)source scale:(CGFloat)scale {
+    if (!source) return NULL;
+
+    size_t width = CGImageGetWidth(source);
+    size_t height = CGImageGetHeight(source);
+    size_t newWidth = (size_t)(width * scale);
+    size_t newHeight = (size_t)(height * scale);
+
+    if (newWidth == 0 || newHeight == 0) return NULL;
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(
+        NULL,
+        newWidth,
+        newHeight,
+        8,
+        newWidth * 4,
+        colorSpace,
+        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst
+    );
+    CGColorSpaceRelease(colorSpace);
+
+    if (!context) return NULL;
+
+    // High-quality interpolation averages blur into cleaner pixels
+    CGContextSetInterpolationQuality(context, kCGInterpolationHigh);
+    CGContextDrawImage(context, CGRectMake(0, 0, newWidth, newHeight), source);
+
+    CGImageRef downscaled = CGBitmapContextCreateImage(context);
+    CGContextRelease(context);
+
+    return downscaled; // Caller must CGImageRelease
+}
+
+/**
+ * Large-radius unsharp mask targeting defocus blur specifically.
+ * A bigger radius (8px) captures the blur spread and compensates for it,
+ * unlike the small-radius sharpen in strategy 1 which targets fine detail.
+ * Combined with desaturation and contrast boost for cleaner binarization.
+ * Best for: out-of-focus barcodes where the camera didn't lock focus properly.
+ */
+- (CGImageRef)createDeblurredImage:(CGImageRef)source {
+    if (!source) return NULL;
+
+    CIImage *ciImage = [CIImage imageWithCGImage:source];
+
+    // Large-radius unsharp mask — counteracts defocus blur
+    CIFilter *sharpen = [CIFilter filterWithName:@"CIUnsharpMask"];
+    [sharpen setValue:ciImage forKey:kCIInputImageKey];
+    [sharpen setValue:@(3.0) forKey:@"inputIntensity"];
+    [sharpen setValue:@(8.0) forKey:@"inputRadius"];
+
+    CIImage *deblurred = sharpen.outputImage;
+    if (!deblurred) return NULL;
+
+    // Desaturate + moderate contrast boost
+    CIFilter *controls = [CIFilter filterWithName:@"CIColorControls"];
+    [controls setValue:deblurred forKey:kCIInputImageKey];
+    [controls setValue:@(0.6) forKey:@"inputContrast"];
+    [controls setValue:@(0.0) forKey:@"inputBrightness"];
+    [controls setValue:@(0.0) forKey:@"inputSaturation"];
+
+    CIImage *output = controls.outputImage;
+    if (!output) return NULL;
+
+    return [self.ciContext createCGImage:output fromRect:output.extent];
+}
+
+#pragma mark - ZXing Decode Helpers
+
+/**
+ * Primary decode path using ZXHybridBinarizer (adaptive local thresholding).
+ */
 - (NSString *)decodeFromCGImage:(CGImageRef)cgImage {
     if (!cgImage) {
         return nil;
@@ -259,6 +529,35 @@ static CGFloat const kMaxAnalysisDimension = 720.0;
     return nil;
 }
 
+/**
+ * Alternative decode path using ZXGlobalHistogramBinarizer.
+ * Uses a single global threshold computed from the image histogram.
+ * Can outperform HybridBinarizer in uniformly-lit conditions.
+ */
+- (NSString *)decodeFromCGImageWithGlobalBinarizer:(CGImageRef)cgImage {
+    if (!cgImage) {
+        return nil;
+    }
+
+    @try {
+        ZXCGImageLuminanceSource *source = [[ZXCGImageLuminanceSource alloc] initWithCGImage:cgImage];
+        ZXGlobalHistogramBinarizer *binarizer = [[ZXGlobalHistogramBinarizer alloc] initWithSource:source];
+        ZXBinaryBitmap *bitmap = [[ZXBinaryBitmap alloc] initWithBinarizer:binarizer];
+
+        NSError *error = nil;
+        ZXResult *zxResult = [self.reader decode:bitmap hints:self.decodeHints error:&error];
+
+        if (zxResult && zxResult.text) {
+            return zxResult.text;
+        }
+
+    } @catch (NSException *exception) {
+        // Expected for non-barcode frames
+    }
+
+    return nil;
+}
+
 - (NSString *)decodeFromImage:(UIImage *)image {
     if (!image) {
         return nil;
@@ -270,6 +569,40 @@ static CGFloat const kMaxAnalysisDimension = 720.0;
     }
 
     return [self decodeFromCGImage:cgImage];
+}
+
+#pragma mark - Image Scaling
+
+- (UIImage *)scaleImageForAnalysis:(UIImage *)image {
+    CGFloat width = image.size.width;
+    CGFloat height = image.size.height;
+
+    if (width <= kMaxAnalysisDimension && height <= kMaxAnalysisDimension) {
+        return image;
+    }
+
+    CGFloat scale = MIN(kMaxAnalysisDimension / width, kMaxAnalysisDimension / height);
+    CGSize newSize = CGSizeMake(width * scale, height * scale);
+
+    UIGraphicsBeginImageContextWithOptions(newSize, YES, 1.0);
+    [image drawInRect:CGRectMake(0, 0, newSize.width, newSize.height)];
+    UIImage *scaledImage = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+
+    return scaledImage;
+}
+
+- (void)processImage:(UIImage *)image {
+    NSString *result = [self decodeFromImage:image];
+
+    if (!result) {
+        UIImage *rotated90 = [self rotateImage:image byDegrees:90];
+        result = [self decodeFromImage:rotated90];
+    }
+
+    if (result && [self isValidAAMVAData:result]) {
+        [self handleDecodedData:result];
+    }
 }
 
 #pragma mark - CGImage Rotation
