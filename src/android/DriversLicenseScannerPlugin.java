@@ -271,8 +271,30 @@ public class DriversLicenseScannerPlugin extends CordovaPlugin {
 
         if (requestCode == SCAN_ACTIVITY_REQUEST && scanCallbackContext != null) {
             if (resultCode == Activity.RESULT_OK && data != null) {
-                // Successful scan
-                String resultJson = data.getStringExtra(EXTRA_RESULT);
+                // Read result JSON — may be in a file to avoid Binder transaction limit.
+                // Base64-encoded images can exceed the ~1MB IPC limit, causing ANR.
+                String resultJson;
+                if (data.getBooleanExtra("resultInFile", false)) {
+                    String filePath = data.getStringExtra(EXTRA_RESULT);
+                    try {
+                        java.io.File resultFile = new java.io.File(filePath);
+                        java.io.FileInputStream fis = new java.io.FileInputStream(resultFile);
+                        byte[] bytes = new byte[(int) resultFile.length()];
+                        fis.read(bytes);
+                        fis.close();
+                        resultJson = new String(bytes, "UTF-8");
+                        resultFile.delete();
+                    } catch (Exception e) {
+                        Log.e(TAG, "Error reading result file: " + filePath, e);
+                        scanCallbackContext.error(createErrorResponse(ERROR_PARSE_ERROR,
+                                "Failed to read scan result file"));
+                        scanCallbackContext = null;
+                        return;
+                    }
+                } else {
+                    resultJson = data.getStringExtra(EXTRA_RESULT);
+                }
+
                 if (resultJson != null) {
                     try {
                         JSONObject result = new JSONObject(resultJson);

@@ -522,24 +522,23 @@ public class BarcodeAnalyzer {
             LuminanceSource source = new RGBLuminanceSource(width, height, pixels);
             BinaryBitmap binaryBitmap = new BinaryBitmap(new HybridBinarizer(source));
 
-            // Try PDF417 reader first
+            // Try PDF417 reader first (primary target for AAMVA data)
             try {
                 Result result = pdf417Reader.decode(binaryBitmap, hints);
-                if (result != null && result.getText() != null) {
-                    String text = result.getText();
-                    if (isLikelyAAMVAData(text)) {
-                        return text;
-                    }
+                if (result != null && result.getText() != null && !result.getText().isEmpty()) {
+                    Log.w(TAG, "ZXing PDF417 decoded! len=" + result.getText().length());
+                    return result.getText(); // PDF417 = always accept
                 }
             } catch (NotFoundException ignored) {
             }
 
-            // Fallback to multi-format reader
+            // Fallback to multi-format reader (may find non-PDF417, so validate)
             try {
                 Result result = multiFormatReader.decode(binaryBitmap);
-                if (result != null && result.getText() != null) {
+                if (result != null && result.getText() != null && !result.getText().isEmpty()) {
                     String text = result.getText();
                     if (isLikelyAAMVAData(text)) {
+                        Log.w(TAG, "ZXing multi-format decoded AAMVA! len=" + text.length());
                         return text;
                     }
                 }
@@ -565,20 +564,19 @@ public class BarcodeAnalyzer {
 
             try {
                 Result result = pdf417Reader.decode(binaryBitmap, hints);
-                if (result != null && result.getText() != null) {
-                    String text = result.getText();
-                    if (isLikelyAAMVAData(text)) {
-                        return text;
-                    }
+                if (result != null && result.getText() != null && !result.getText().isEmpty()) {
+                    Log.w(TAG, "ZXing global PDF417 decoded! len=" + result.getText().length());
+                    return result.getText(); // PDF417 = always accept
                 }
             } catch (NotFoundException ignored) {
             }
 
             try {
                 Result result = multiFormatReader.decode(binaryBitmap);
-                if (result != null && result.getText() != null) {
+                if (result != null && result.getText() != null && !result.getText().isEmpty()) {
                     String text = result.getText();
                     if (isLikelyAAMVAData(text)) {
+                        Log.w(TAG, "ZXing global multi-format decoded AAMVA! len=" + text.length());
                         return text;
                     }
                 }
@@ -621,24 +619,31 @@ public class BarcodeAnalyzer {
 
     /**
      * Checks if the decoded data looks like AAMVA driver license data.
+     * Relaxed: accepts data with any AAMVA markers or field codes.
      */
     private boolean isLikelyAAMVAData(String data) {
-        if (data == null || data.length() < 20) {
+        if (data == null || data.length() < 10) {
             return false;
         }
 
         boolean hasStartMarker = data.startsWith("@") ||
                 data.contains("@\n") ||
-                data.contains("@\r");
+                data.contains("@\r") ||
+                data.contains("@\u001e");
 
-        boolean hasANSIMarker = data.contains("ANSI");
+        boolean hasANSIMarker = data.contains("ANSI") || data.contains("AAMVA");
 
         boolean hasFieldCodes = data.contains("DAQ") ||
                 data.contains("DCS") ||
                 data.contains("DAC") ||
-                data.contains("DBB");
+                data.contains("DBB") ||
+                data.contains("DBA") ||
+                data.contains("DAG") ||
+                data.contains("DAI") ||
+                data.contains("DAJ");
 
-        return (hasStartMarker || hasANSIMarker) && hasFieldCodes;
+        // Accept if ANY of these conditions are true (more permissive)
+        return hasStartMarker || hasANSIMarker || hasFieldCodes;
     }
 
     // ==================== Public Methods ====================

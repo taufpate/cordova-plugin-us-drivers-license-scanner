@@ -138,10 +138,16 @@ public class AAMVAParser {
      * Normalizes barcode data by standardizing line endings and removing noise.
      */
     private String normalizeData(String data) {
-        // Replace various line ending formats with standard newline
+        // Replace various delimiters with standard newline.
+        // AAMVA barcodes use different delimiters across versions:
+        // - \r\n or \r (line endings)
+        // - \u001e (record separator, RS, 0x1E)
+        // - \u001f (unit separator, US, 0x1F) — strip these entirely
         String normalized = data
                 .replace("\r\n", "\n")
-                .replace("\r", "\n");
+                .replace("\r", "\n")
+                .replace("\u001e", "\n")
+                .replace("\u001f", "");
 
         // Remove any leading/trailing whitespace from each line
         String[] lines = normalized.split("\n");

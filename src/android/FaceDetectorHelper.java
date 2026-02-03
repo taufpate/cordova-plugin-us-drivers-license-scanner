@@ -101,20 +101,22 @@ public class FaceDetectorHelper {
     }
 
     /**
-     * Initializes a fast face detector for live video frame analysis.
-     * Uses PERFORMANCE_MODE_FAST for lower latency during video scanning.
+     * Initializes a face detector for live video frame analysis.
+     * Uses PERFORMANCE_MODE_ACCURATE with a very small minFaceSize to
+     * detect the small printed face on a driver's license held at arm's length.
      */
     private void initializeLiveDetector() {
         FaceDetectorOptions options = new FaceDetectorOptions.Builder()
-                .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+                .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
                 .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_NONE)
                 .setContourMode(FaceDetectorOptions.CONTOUR_MODE_NONE)
                 .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_NONE)
-                .setMinFaceSize(0.05f)
+                // Very small minFaceSize to detect printed license photos
+                .setMinFaceSize(0.01f)
                 .build();
 
         liveFaceDetector = FaceDetection.getClient(options);
-        Log.d(TAG, "Live face detector initialized");
+        Log.d(TAG, "Live face detector initialized (accurate mode, minFace=0.01)");
     }
 
     /**
@@ -154,18 +156,18 @@ public class FaceDetectorHelper {
             return;
         }
 
+        Log.d(TAG, "checkForFacePresence: bitmap " + bitmap.getWidth() + "x" + bitmap.getHeight());
+
         InputImage inputImage = InputImage.fromBitmap(bitmap, 0);
 
         liveFaceDetector.process(inputImage)
                 .addOnSuccessListener(faces -> {
                     boolean found = faces != null && !faces.isEmpty();
-                    if (found) {
-                        Log.d(TAG, "Live face detected (" + faces.size() + " face(s))");
-                    }
+                    Log.d(TAG, "Live face check result: " + (found ? faces.size() + " face(s) FOUND" : "no faces"));
                     liveFaceCallback.onFacePresenceDetected(found);
                 })
                 .addOnFailureListener(e -> {
-                    Log.w(TAG, "Live face detection failed", e);
+                    Log.w(TAG, "Live face detection failed: " + e.getMessage(), e);
                     liveFaceCallback.onFacePresenceDetected(false);
                 });
     }
