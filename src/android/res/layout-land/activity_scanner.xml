@@ -1,0 +1,245 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Scanner Activity Layout — Landscape orientation
+  Used automatically by Android when the device is held in landscape mode.
+
+  Landscape scanning advantage for PDF417:
+  - The card is held in its natural horizontal orientation
+  - The barcode spans the full WIDTH of the camera sensor (1920px)
+  - This gives ~1.6 px/module before upscaling vs ~0.9 px/module in portrait
+  - After 3x upscaling: ~4.8 px/module — well above the 2px/module threshold
+
+  Layout design: camera fills the screen, card frame occupies center,
+  a compact control bar lives at the bottom. Instruction text floats at top.
+-->
+<androidx.constraintlayout.widget.ConstraintLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/black">
+
+    <!-- Camera Preview (fullscreen) -->
+    <androidx.camera.view.PreviewView
+        android:id="@+id/camera_preview"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <!-- Dark overlay above frame -->
+    <View
+        android:id="@+id/overlay_background_top"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:background="#80000000"
+        app:layout_constraintBottom_toTopOf="@id/overlay_frame"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <!-- Dark overlay below frame (extends to bottom_bar) -->
+    <View
+        android:id="@+id/overlay_background_bottom"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:background="#80000000"
+        app:layout_constraintBottom_toTopOf="@id/bottom_bar"
+        app:layout_constraintTop_toBottomOf="@id/overlay_frame" />
+
+    <!-- Dark overlay left of frame -->
+    <View
+        android:id="@+id/overlay_background_left"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:background="#80000000"
+        app:layout_constraintBottom_toTopOf="@id/overlay_background_bottom"
+        app:layout_constraintEnd_toStartOf="@id/overlay_frame"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/overlay_background_top" />
+
+    <!-- Dark overlay right of frame -->
+    <View
+        android:id="@+id/overlay_background_right"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:background="#80000000"
+        app:layout_constraintBottom_toTopOf="@id/overlay_background_bottom"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toEndOf="@id/overlay_frame"
+        app:layout_constraintTop_toBottomOf="@id/overlay_background_top" />
+
+    <!--
+      Card Frame Overlay — landscape-optimized sizing.
+      With 1.586:1 ratio constrained between top and bottom_bar (48dp):
+        available height ≈ 720 - 48 = 672dp
+        frame height = 672dp, frame width = 672 × 1.586 ≈ 1065dp
+        this fills most of the landscape screen, giving maximum barcode pixels.
+    -->
+    <View
+        android:id="@+id/overlay_frame"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_marginStart="12dp"
+        android:layout_marginEnd="12dp"
+        android:background="@drawable/scan_overlay"
+        app:layout_constraintDimensionRatio="1.586:1"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toTopOf="@id/bottom_bar"
+        app:layout_constraintVertical_bias="0.5" />
+
+    <!-- Instruction Text: floats at top of card frame with dark backing for legibility -->
+    <TextView
+        android:id="@+id/instruction_text"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="16dp"
+        android:layout_marginEnd="16dp"
+        android:layout_marginTop="4dp"
+        android:background="#99000000"
+        android:gravity="center"
+        android:padding="5dp"
+        android:text="Position the FRONT of your driver license"
+        android:textColor="@android:color/white"
+        android:textSize="15sp"
+        android:textStyle="bold"
+        android:shadowColor="#000000"
+        android:shadowDx="1"
+        android:shadowDy="1"
+        android:shadowRadius="3"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <!--
+      Bottom control bar: status text (left, weight=1) + Flash + Cancel buttons (right).
+      Uses a dark semi-transparent background to stay visible over the preview.
+    -->
+    <LinearLayout
+        android:id="@+id/bottom_bar"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:paddingStart="12dp"
+        android:paddingEnd="12dp"
+        android:background="#CC000000"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent">
+
+        <!-- Status text takes all available space -->
+        <TextView
+            android:id="@+id/status_text"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Align the license within the frame"
+            android:textColor="#CCCCCC"
+            android:textSize="13sp"
+            android:shadowColor="#000000"
+            android:shadowDx="1"
+            android:shadowDy="1"
+            android:shadowRadius="2" />
+
+        <Button
+            android:id="@+id/flash_button"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:layout_marginEnd="8dp"
+            android:background="@drawable/rounded_button"
+            android:text="Flash On"
+            android:textColor="@android:color/white"
+            android:textSize="13sp"
+            android:minWidth="72dp" />
+
+        <Button
+            android:id="@+id/cancel_button"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:background="@drawable/rounded_button"
+            android:text="Cancel"
+            android:textColor="@android:color/white"
+            android:textSize="13sp"
+            android:minWidth="72dp" />
+
+    </LinearLayout>
+
+    <!-- Flip Instruction Container — horizontal layout for landscape compactness -->
+    <LinearLayout
+        android:id="@+id/flip_instruction_container"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:orientation="horizontal"
+        android:visibility="gone"
+        android:padding="24dp"
+        android:background="#CC000000"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent">
+
+        <ImageView
+            android:id="@+id/flip_icon"
+            android:layout_width="72dp"
+            android:layout_height="72dp"
+            android:contentDescription="Flip card"
+            android:src="@android:drawable/ic_menu_rotate"
+            android:tint="@android:color/white" />
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="20dp"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Please flip your license to scan the back"
+                android:textColor="@android:color/white"
+                android:textSize="20sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Scanning will continue automatically"
+                android:textColor="#AAAAAA"
+                android:textSize="14sp" />
+
+        </LinearLayout>
+
+    </LinearLayout>
+
+    <!-- Progress Bar (shown during PROCESSING state) -->
+    <ProgressBar
+        android:id="@+id/progress_bar"
+        android:layout_width="64dp"
+        android:layout_height="64dp"
+        android:indeterminate="true"
+        android:visibility="gone"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <!-- Capture Button (unused in landscape, kept for ID compatibility) -->
+    <com.google.android.material.floatingactionbutton.FloatingActionButton
+        android:id="@+id/capture_button"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:contentDescription="Capture"
+        android:visibility="gone"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent"
+        app:backgroundTint="@android:color/white"
+        app:fabSize="normal" />
+
+</androidx.constraintlayout.widget.ConstraintLayout>

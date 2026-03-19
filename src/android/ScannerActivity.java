@@ -17,6 +17,8 @@ package com.sos.driverslicensescanner;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
+import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.os.Bundle;
@@ -125,6 +127,9 @@ public class ScannerActivity extends AppCompatActivity implements
     private Runnable barcodeScanRunnable;
     private int previewScanCount = 0;
 
+    // Layout ID stored for re-inflation on orientation change
+    private int layoutId;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -132,8 +137,9 @@ public class ScannerActivity extends AppCompatActivity implements
         // Keep screen on during scanning
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-        // Set content view using resource ID lookup
-        int layoutId = getResources().getIdentifier("activity_scanner", "layout", getPackageName());
+        // Set content view using resource ID lookup.
+        // Android automatically selects res/layout-land/ in landscape, res/layout/ in portrait.
+        layoutId = getResources().getIdentifier("activity_scanner", "layout", getPackageName());
         setContentView(layoutId);
 
         // Initialize components
@@ -269,8 +275,8 @@ public class ScannerActivity extends AppCompatActivity implements
                 break;
 
             case SCANNING_BACK:
-                instructionText.setText("Position the BACK of your driver license");
-                statusText.setText("Scanning barcode...");
+                instructionText.setText("Scan the BACK of your driver license");
+                statusText.setText("Tip: rotate phone sideways for faster scan");
                 setOverlayColor(Color.WHITE);
                 break;
 
@@ -313,14 +319,18 @@ public class ScannerActivity extends AppCompatActivity implements
      */
     private void startFrontScan() {
         Log.w(TAG, "Starting front scan (auto-capture in " + FACE_FALLBACK_TIMEOUT_MS + "ms)");
-        Toast.makeText(this, "Position front of license...", Toast.LENGTH_SHORT).show();
 
         frontCaptureTriggered = false;
         faceCheckCounter = 0;
 
-        // Start camera in simple mode (no live face detection, no barcode scanning)
-        // Just preview + capture capability
-        cameraManager.startCamera(false, false);
+        // Front scan is portrait-only: the user needs to see the card face and portrait photo.
+        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+
+        // Start camera with face detection enabled on live video frames.
+        // Every 5th ImageAnalysis frame is fed to ML Kit face detection (checkForFacePresence).
+        // When a face is found, auto-capture fires immediately (matches iOS behavior).
+        // The 3-second faceFallbackRunnable below captures anyway if no face is detected.
+        cameraManager.startCamera(false, true);
 
         // Overall timeout: fail if front scan takes too long
         startTimeout(() -> {
@@ -341,12 +351,10 @@ public class ScannerActivity extends AppCompatActivity implements
                 Bitmap previewBitmap = previewView.getBitmap();
                 if (previewBitmap != null) {
                     Log.w(TAG, "Got preview bitmap: " + previewBitmap.getWidth() + "x" + previewBitmap.getHeight());
-                    Toast.makeText(ScannerActivity.this, "Front captured!", Toast.LENGTH_SHORT).show();
                     onImageCaptured(previewBitmap);
                 } else {
                     // Fallback to CameraX capture if preview bitmap not available
                     Log.w(TAG, "Preview bitmap null, falling back to CameraX capture");
-                    Toast.makeText(ScannerActivity.this, "Trying CameraX capture...", Toast.LENGTH_SHORT).show();
                     cameraManager.captureImage();
                 }
             }
@@ -384,7 +392,6 @@ public class ScannerActivity extends AppCompatActivity implements
      */
     private void startBackScan() {
         Log.w(TAG, "Starting back scan (barcode mode)");
-        Toast.makeText(this, "Scanning barcode on back...", Toast.LENGTH_SHORT).show();
 
         // Reset barcode analyzer strategy rotation for fresh scan
         cameraManager.resetBarcodeAnalyzer();
@@ -394,10 +401,13 @@ public class ScannerActivity extends AppCompatActivity implements
         // AND preview bitmaps (via scanPreviewForBarcode). Both run in parallel.
         cameraManager.startCamera(true);
 
-        // Apply moderate zoom to make the barcode larger in frame.
-        // PDF417 barcodes need at least 2 pixels per module. The crop+3x upscale+sharpen
-        // pipeline compensates for lower zoom, so 0.50 is sufficient and comfortable.
-        mainHandler.postDelayed(() -> cameraManager.setZoom(0.50f), 500);
+        // Gentle zoom (0.25f) is applied immediately inside startCamera() so the barcode
+        // fills more of the frame. No postDelayed — the user never sees the un-zoomed state.
+
+        // Allow landscape rotation for back scan — landscape gives ~4.8 px/module (vs ~2.7 in portrait)
+        // because the camera sensor's native landscape orientation aligns with the card's horizontal layout.
+        // Android will automatically use res/layout-land/activity_scanner.xml when the user rotates.
+        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
 
         // Set timeout for back scan
         startTimeout(() -> {
@@ -443,22 +453,12 @@ public class ScannerActivity extends AppCompatActivity implements
                     saveDebugBitmap(previewScanCount);
                 }
 
-                // Trigger autofocus once at scan 2 (after camera has warmed up), then
-                // leave CameraX's continuous AF undisturbed. Manual AF calls cause focus
-                // hunting on this device — sharpness drops from 26% to 0% between frames.
-                if (previewScanCount == 2) {
-                    cameraManager.requestAutoFocus();
-                }
+                // No manual AF calls — CameraX continuous AF handles focusing automatically.
+                // Manual AF calls caused focus hunting (sharpness drop from 26% to 0% between frames).
 
-                // Show diagnostic Toast every ~5 seconds (10 * 500ms)
+                // Update status text periodically so the user knows scanning is active
                 if (previewScanCount % 10 == 0) {
-                    int mlkit = cameraManager.getLastMlKitResultCount();
-                    int diag = cameraManager.getLastDiagnosticCount();
-                    String diagFmt = cameraManager.getLastDiagnosticFormats();
-                    Toast.makeText(ScannerActivity.this,
-                            "#" + previewScanCount + " ml=" + mlkit
-                            + " diag=" + diag + " " + diagFmt,
-                            Toast.LENGTH_SHORT).show();
+                    statusText.setText("Scanning barcode... keep steady");
                 }
 
                 } catch (Throwable t) {
@@ -826,7 +826,6 @@ public class ScannerActivity extends AppCompatActivity implements
 
         runOnUiThread(() -> {
             if (currentState == ScanState.SCANNING_FRONT) {
-                Toast.makeText(this, "Portrait extracted! Flipping...", Toast.LENGTH_SHORT).show();
                 transitionToState(ScanState.FLIP_INSTRUCTION);
             }
         });
@@ -838,7 +837,6 @@ public class ScannerActivity extends AppCompatActivity implements
 
         runOnUiThread(() -> {
             if (currentState == ScanState.SCANNING_FRONT) {
-                Toast.makeText(this, "No face found, using crop. Flipping...", Toast.LENGTH_SHORT).show();
                 transitionToState(ScanState.FLIP_INSTRUCTION);
             }
         });
@@ -850,7 +848,6 @@ public class ScannerActivity extends AppCompatActivity implements
 
         runOnUiThread(() -> {
             if (currentState == ScanState.SCANNING_FRONT) {
-                Toast.makeText(this, "Face error, continuing. Flipping...", Toast.LENGTH_SHORT).show();
                 transitionToState(ScanState.FLIP_INSTRUCTION);
             }
         });
@@ -976,11 +973,53 @@ public class ScannerActivity extends AppCompatActivity implements
 
     // ==================== Lifecycle Methods ====================
 
+    /**
+     * Called when the device orientation changes (portrait ↔ landscape).
+     * Fires only because android:configChanges includes "orientation|screenSize",
+     * which prevents the Activity from restarting on rotation.
+     *
+     * Strategy:
+     * 1. Re-inflate the layout — Android automatically picks layout-land/ in landscape
+     *    or layout/ in portrait, giving the correct UI for each orientation.
+     * 2. Re-bind all view references (new instances after setContentView).
+     * 3. Update the camera's SurfaceProvider to the new PreviewView.
+     * 4. Restore the UI state for the current scan phase.
+     *
+     * The camera itself keeps running uninterrupted across orientation changes.
+     */
+    @Override
+    public void onConfigurationChanged(@NonNull Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+
+        // Re-inflate: Android resolves layout-land/ vs layout/ based on newConfig.
+        setContentView(layoutId);
+
+        // Re-bind all view references (they are new objects after setContentView).
+        initializeViews();
+
+        // Restore flash button label (toggle state survives but label is reset by re-inflation).
+        flashButton.setText(isFlashOn ? "Flash Off" : "Flash On");
+
+        // Reconnect camera preview to the new PreviewView surface.
+        if (cameraManager != null) {
+            cameraManager.updatePreviewView(previewView);
+        }
+
+        // Restore UI for the current scan state.
+        updateUIForState(currentState);
+
+        // In landscape during back scan: acknowledge the better orientation.
+        if (currentState == ScanState.SCANNING_BACK
+                && newConfig.orientation == Configuration.ORIENTATION_LANDSCAPE) {
+            statusText.setText("Landscape mode: scanning barcode...");
+        }
+    }
+
     @Override
     protected void onResume() {
         super.onResume();
         if (currentState == ScanState.SCANNING_FRONT) {
-            cameraManager.startCamera(false, false);
+            cameraManager.startCamera(false, true); // re-enable live face detection on resume
         } else if (currentState == ScanState.SCANNING_BACK) {
             cameraManager.startCamera(true);
         }

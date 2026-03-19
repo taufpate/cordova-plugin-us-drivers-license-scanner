@@ -36,8 +36,8 @@
             <activity
                 android:name="com.sos.driverslicensescanner.ScannerActivity"
                 android:theme="@style/Theme.AppCompat.NoActionBar"
-                android:screenOrientation="portrait"
-                android:configChanges="orientation|screenSize"
+                android:screenOrientation="fullSensor"
+                android:configChanges="orientation|screenSize|keyboardHidden"
                 android:exported="false" />
         </config-file>
 
@@ -53,6 +53,7 @@
 
         <!-- Layout Files -->
         <source-file src="src/android/res/layout/activity_scanner.xml" target-dir="res/layout" />
+        <source-file src="src/android/res/layout-land/activity_scanner.xml" target-dir="res/layout-land" />
 
         <!-- Drawable Files -->
         <source-file src="src/android/res/drawable/scan_overlay.xml" target-dir="res/drawable" />

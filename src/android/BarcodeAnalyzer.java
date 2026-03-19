@@ -52,7 +52,7 @@ public class BarcodeAnalyzer {
     private static final String TAG = "BarcodeAnalyzer";
 
     // Number of enhanced strategies to rotate through (excludes the original which always runs)
-    private static final int ENHANCED_STRATEGY_COUNT = 8;
+    private static final int ENHANCED_STRATEGY_COUNT = 10;
 
     /**
      * Callback interface for barcode detection results.
@@ -253,6 +253,35 @@ public class BarcodeAnalyzer {
                     result = tryDecode(deblurred, width, height);
                     if (result != null) {
                         Log.d(TAG, "Decoded via deblur strategy");
+                    }
+                }
+                break;
+            }
+            case 8: {
+                // Green-channel-only grayscale.
+                // CMOS sensors have 2× green photosites (Bayer pattern) so the green channel
+                // has higher SNR than the weighted luminance (0.299R+0.587G+0.114B).
+                // Under fluorescent/mixed lighting the green channel also avoids the
+                // orange/blue colour casts that confuse luminance-based binarizers.
+                int[] greenOnly = createGreenChannelImage(pixels, width, height);
+                if (greenOnly != null) {
+                    result = tryDecode(greenOnly, width, height);
+                    if (result != null) {
+                        Log.d(TAG, "Decoded via green-channel strategy");
+                    }
+                }
+                break;
+            }
+            case 9: {
+                // Local adaptive block equalization.
+                // Divides the image into 8×8 tiles and stretches the histogram of each tile
+                // independently. Handles vignetting, shadows, and uneven illumination that
+                // global contrast stretch cannot fix — common on cheap camera modules.
+                int[] adaptive = createAdaptiveBlockImage(pixels, width, height);
+                if (adaptive != null) {
+                    result = tryDecode(adaptive, width, height);
+                    if (result != null) {
+                        Log.d(TAG, "Decoded via adaptive-block strategy");
                     }
                 }
                 break;
@@ -510,6 +539,82 @@ public class BarcodeAnalyzer {
         }
 
         return output;
+    }
+
+    /**
+     * Extracts the green channel only and applies a mild contrast boost.
+     * CMOS sensors use a Bayer pattern with 2× green photosites, giving green
+     * the best signal-to-noise ratio. Under mixed or fluorescent lighting this
+     * produces a cleaner grayscale than the standard luminance formula.
+     */
+    private int[] createGreenChannelImage(int[] pixels, int width, int height) {
+        int[] result = new int[pixels.length];
+        for (int i = 0; i < pixels.length; i++) {
+            int g = (pixels[i] >> 8) & 0xFF;
+            // Mild contrast boost (1.3×) around midpoint to widen the bar/space gap
+            int val = clamp((int) ((g - 128) * 1.3f + 128));
+            result[i] = 0xFF000000 | (val << 16) | (val << 8) | val;
+        }
+        return result;
+    }
+
+    /**
+     * Local adaptive block equalization (simple CLAHE approximation).
+     * Divides the image into an 8×8 grid of tiles; within each tile the luminance
+     * histogram is stretched to the full 0-255 range. This corrects vignetting,
+     * partial shadows, and uneven illumination — artefacts that are common with
+     * budget camera modules and prevent global contrast stretch from working well.
+     * Tiles with very low dynamic range (range < 20) are left untouched to avoid
+     * amplifying flat noise regions.
+     */
+    private int[] createAdaptiveBlockImage(int[] pixels, int width, int height) {
+        // Convert to luminance array
+        int[] lum = new int[pixels.length];
+        for (int i = 0; i < pixels.length; i++) {
+            lum[i] = luminance((pixels[i] >> 16) & 0xFF, (pixels[i] >> 8) & 0xFF, pixels[i] & 0xFF);
+        }
+
+        int[] result = new int[pixels.length];
+        int tilesX = 8;
+        int tilesY = 8;
+        int tileW = Math.max(1, width / tilesX);
+        int tileH = Math.max(1, height / tilesY);
+
+        for (int ty = 0; ty < tilesY; ty++) {
+            for (int tx = 0; tx < tilesX; tx++) {
+                int sx = tx * tileW;
+                int sy = ty * tileH;
+                int ex = (tx == tilesX - 1) ? width  : sx + tileW;
+                int ey = (ty == tilesY - 1) ? height : sy + tileH;
+
+                // Find min/max luminance in this tile
+                int minV = 255, maxV = 0;
+                for (int y = sy; y < ey; y++) {
+                    for (int x = sx; x < ex; x++) {
+                        int v = lum[y * width + x];
+                        if (v < minV) minV = v;
+                        if (v > maxV) maxV = v;
+                    }
+                }
+
+                int range = maxV - minV;
+                for (int y = sy; y < ey; y++) {
+                    for (int x = sx; x < ex; x++) {
+                        int v;
+                        if (range < 20) {
+                            // Nearly flat tile — use luminance as-is to avoid noise amplification
+                            v = lum[y * width + x];
+                        } else {
+                            // Stretch to full 0-255 range
+                            v = clamp((int) ((lum[y * width + x] - minV) * 255f / range));
+                        }
+                        result[y * width + x] = 0xFF000000 | (v << 16) | (v << 8) | v;
+                    }
+                }
+            }
+        }
+
+        return result;
     }
 
     // ==================== ZXing Decode Helpers ====================

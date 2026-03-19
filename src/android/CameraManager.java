@@ -96,7 +96,7 @@ public class CameraManager {
     }
 
     private final Context context;
-    private final PreviewView previewView;
+    private PreviewView previewView; // non-final: updated when layout re-inflates on orientation change
     private final ScanCallback callback;
     private final ExecutorService cameraExecutor;
     private final BarcodeAnalyzer zxingAnalyzer;
@@ -219,6 +219,14 @@ public class CameraManager {
                 cameraProvider = cameraProviderFuture.get();
                 bindCameraUseCases();
                 isCameraRunning = true;
+                // Apply a gentle zoom immediately after binding so the barcode fills more
+                // of the frame. Done here (not with postDelayed) so there is no visible
+                // transition — the user never sees the un-zoomed state.
+                if (enableBarcodeScanning && camera != null) {
+                    camera.getCameraControl().setLinearZoom(0.25f);
+                    currentZoom = 0.25f;
+                    Log.w(TAG, "Initial zoom 0.25f applied for barcode scan");
+                }
                 Log.w(TAG, "Camera started successfully, barcodeScanning=" + isBarcodeScanning);
             } catch (ExecutionException | InterruptedException e) {
                 Log.e(TAG, "Error starting camera", e);
@@ -268,6 +276,13 @@ public class CameraManager {
         }
     }
 
+    /**
+     * Binds camera use cases using plain CameraX (no Camera2Interop).
+     *
+     * Camera2Interop was removed because it triggers MediaTek "seamless switch mode"
+     * which drops the preview to 7fps with 1-second frame freezes on MediaTek devices.
+     * Plain CameraX runs at the camera's native fps (30fps) with its own continuous AF.
+     */
     private void bindCameraUseCases() {
         if (cameraProvider == null) {
             Log.e(TAG, "Camera provider is null");
@@ -280,6 +295,9 @@ public class CameraManager {
                 .requireLensFacing(CameraSelector.LENS_FACING_BACK)
                 .build();
 
+        // Plain Preview — CameraX uses continuous AF by default on most devices.
+        // No Camera2Interop: it causes MediaTek HAL to enter "seamless switch mode"
+        // which drops the camera to 7fps with 1-second frame freezes.
         preview = new Preview.Builder().build();
         preview.setSurfaceProvider(previewView.getSurfaceProvider());
 
@@ -540,6 +558,19 @@ public class CameraManager {
     public float getCurrentZoom() { return currentZoom; }
 
     /**
+     * Updates the PreviewView reference after a layout re-inflation (e.g., on orientation change).
+     * The camera keeps running; only the surface provider is switched to the new view.
+     * Called from ScannerActivity.onConfigurationChanged() after setContentView().
+     */
+    public void updatePreviewView(PreviewView newPreviewView) {
+        this.previewView = newPreviewView;
+        if (preview != null) {
+            preview.setSurfaceProvider(newPreviewView.getSurfaceProvider());
+            Log.w(TAG, "PreviewView updated after orientation change");
+        }
+    }
+
+    /**
      * Returns the last ML Kit result count for diagnostics.
      * -1 = not yet run, 0 = ran but found nothing, >0 = found barcodes.
      */
@@ -717,35 +748,57 @@ public class CameraManager {
     }
 
     /**
-     * Crops the barcode region from the bitmap, upscales 3x, and applies software sharpening.
-     * The barcode can appear anywhere from 10% to 75% of the frame height depending on how
-     * the user holds the card, so the crop region is generous.
+     * Crops the barcode region from the bitmap, upscales 3x, and sharpens.
      *
-     * Pipeline: crop → 3x upscale → sharpen (3x3 kernel)
+     * Pipeline: crop → 3x upscale (bilinear) → sharpen (3x3) → contrast stretch
      *
-     * The sharpening compensates for camera focus limitations — even when continuous AF
-     * produces slightly blurry frames (edge=3-7, sharp=2-10%), the sharpening restores
-     * enough edge definition for ML Kit and ZXing to decode the barcode.
+     * Crop regions differ by orientation:
      *
-     * @param source The full bitmap (720x1600 preview or 1080x1920 IA frame after rotation)
+     * PORTRAIT (w < h, e.g. 720×1600):
+     *   - Card is held landscape inside a portrait frame
+     *   - Barcode is in the center-bottom of the card, roughly at 10–75% height
+     *   - Crop: 2% horizontal margin, rows 10–75% of frame height
+     *
+     * LANDSCAPE (w > h, e.g. 1280×720):
+     *   - Card held in natural landscape orientation fills the wide dimension
+     *   - Camera sensor (1920×1080, native landscape) maps better → more px/module
+     *   - Barcode is at the BOTTOM of the card → lower in the frame than in portrait
+     *   - Extend crop to 88% of height to ensure barcode isn't cut off at the bottom
+     *   - Result: ~4.8 px/module after 3x upscale vs ~2.7 px/module in portrait
+     *
+     * @param source Full bitmap from PreviewView.getBitmap() (correctly rotated for display)
      * @return Processed bitmap optimized for barcode decoding
      */
     private Bitmap cropAndUpscaleForBarcode(Bitmap source) {
         int w = source.getWidth();
         int h = source.getHeight();
 
-        // Crop region: 2% margin horizontally, 10% to 75% vertically (covers all card positions)
-        int cropLeft = (int)(w * 0.02);
-        int cropTop = (int)(h * 0.10);
-        int cropW = Math.min((int)(w * 0.96), w - cropLeft);
-        int cropH = Math.min((int)(h * 0.65), h - cropTop);
+        final int cropLeft, cropTop, cropW, cropH;
+        if (w > h) {
+            // Landscape: card fills full width, barcode at card bottom → extend crop lower
+            cropLeft = (int)(w * 0.02);
+            cropTop  = (int)(h * 0.05);   // 5% top margin (card starts near top in landscape)
+            cropW    = Math.min((int)(w * 0.96), w - cropLeft);
+            cropH    = Math.min((int)(h * 0.88), h - cropTop); // 88% = down to near bottom
+        } else {
+            // Portrait: original crop region (10–75% vertically)
+            cropLeft = (int)(w * 0.02);
+            cropTop  = (int)(h * 0.10);
+            cropW    = Math.min((int)(w * 0.96), w - cropLeft);
+            cropH    = Math.min((int)(h * 0.65), h - cropTop);
+        }
 
         try {
             Bitmap cropped = Bitmap.createBitmap(source, cropLeft, cropTop, cropW, cropH);
-            // 3x upscale with bilinear filtering for more pixels per barcode module
+            // 3x upscale with bilinear filtering for more pixels per barcode module.
+            // NOTE: Denoising was tried here before upscaling but destroyed the barcode:
+            // at ~0.95 px/module native resolution, a 3×3 blur averages 3+ modules together,
+            // smearing bar/space transitions that the decoder needs. Denoising is only safe
+            // AFTER upscaling (2.85 px/module), but the sharpen pass below already handles
+            // the minor bilinear softening — adding another denoise pass is not needed.
             Bitmap upscaled = Bitmap.createScaledBitmap(cropped, cropW * 3, cropH * 3, true);
             cropped.recycle();
-            // Apply software sharpening to compensate for camera focus blur
+            // Sharpen to restore edges softened by bilinear upscaling
             Bitmap sharpened = sharpenBitmap(upscaled);
             upscaled.recycle();
             return sharpened;
@@ -757,6 +810,57 @@ public class CameraManager {
                 return source;
             }
         }
+    }
+
+    /**
+     * Applies a 3x3 box blur (mean filter) for sensor noise reduction.
+     * Called at native resolution BEFORE upscaling so it is computationally cheap.
+     *
+     * Box blur averages each pixel with its 8 neighbors, smoothing:
+     * - Salt-and-pepper noise (dead/hot pixels) — common on budget sensors
+     * - Sensor banding and fixed-pattern noise — amplified by sharpening if not removed
+     * - High-frequency chroma noise — produces color artifacts in grayscale conversion
+     *
+     * Edge pixels are copied unchanged to avoid border artifacts.
+     */
+    private Bitmap denoiseBitmap(Bitmap src) {
+        int w = src.getWidth();
+        int h = src.getHeight();
+        int[] pixels = new int[w * h];
+        src.getPixels(pixels, 0, w, 0, 0, w, h);
+        int[] result = new int[w * h];
+
+        for (int y = 1; y < h - 1; y++) {
+            for (int x = 1; x < w - 1; x++) {
+                int rSum = 0, gSum = 0, bSum = 0;
+                // Sum 3x3 neighborhood
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        int p = pixels[(y + dy) * w + (x + dx)];
+                        rSum += (p >> 16) & 0xFF;
+                        gSum += (p >> 8) & 0xFF;
+                        bSum += p & 0xFF;
+                    }
+                }
+                result[y * w + x] = 0xFF000000
+                        | ((rSum / 9) << 16)
+                        | ((gSum / 9) << 8)
+                        | (bSum / 9);
+            }
+        }
+        // Copy border pixels unchanged
+        for (int x = 0; x < w; x++) {
+            result[x] = pixels[x];
+            result[(h - 1) * w + x] = pixels[(h - 1) * w + x];
+        }
+        for (int y = 0; y < h; y++) {
+            result[y * w] = pixels[y * w];
+            result[y * w + w - 1] = pixels[y * w + w - 1];
+        }
+
+        Bitmap out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        out.setPixels(result, 0, w, 0, 0, w, h);
+        return out;
     }
 
     /**
