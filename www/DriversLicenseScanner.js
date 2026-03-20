@@ -253,15 +253,15 @@ module.exports = DriversLicenseScanner;
  * @property {string} issueDateRaw - Raw issue date from barcode
  * @property {string} expirationDate - Expiration date (YYYY-MM-DD format) (DBA)
  * @property {string} expirationDateRaw - Raw expiration date from barcode
- * @property {string} issuingState - Issuing state (DCG or from header)
+ * @property {string} issuingState - Issuing state (DAJ)
  * @property {string} issuingCountry - Issuing country (DCG)
  * @property {string} documentDiscriminator - Document discriminator (DCF)
  * @property {string} height - Height (DAU)
  * @property {string} eyeColor - Eye color (DAY)
  * @property {string} hairColor - Hair color (DAZ)
  * @property {string} weight - Weight (DAW)
- * @property {string} suffix - Name suffix (DCU)
- * @property {string} prefix - Name prefix (DAA)
+ * @property {string} nameSuffix - Name suffix (DCU)
+ * @property {string} namePrefix - Name prefix (DAA)
  * @property {string} aamvaVersion - AAMVA version number
  * @property {string} jurisdictionVersion - Jurisdiction version
  * @property {Object} additionalFields - Any additional parsed fields

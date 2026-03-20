@@ -120,9 +120,15 @@ static NSString *const kFieldFullName = @"DAA";
 #pragma mark - Data Normalization
 
 - (NSString *)normalizeData:(NSString *)data {
-    // Replace various line endings with standard newline
+    // Replace various AAMVA delimiters with standard newline.
+    // AAMVA barcodes use different delimiters across versions:
+    //   \r\n / \r  — line endings
+    //   \u001e (RS, 0x1E) — record separator used in AAMVA v3+
+    //   \u001f (US, 0x1F) — unit separator, strip entirely
     NSString *normalized = [data stringByReplacingOccurrencesOfString:@"\r\n" withString:@"\n"];
     normalized = [normalized stringByReplacingOccurrencesOfString:@"\r" withString:@"\n"];
+    normalized = [normalized stringByReplacingOccurrencesOfString:@"\x1e" withString:@"\n"];
+    normalized = [normalized stringByReplacingOccurrencesOfString:@"\x1f" withString:@""];
 
     // Trim whitespace from each line
     NSMutableArray *lines = [NSMutableArray array];

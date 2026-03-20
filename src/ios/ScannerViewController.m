@@ -15,11 +15,6 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <Vision/Vision.h>
 
-// Face detection runs every Nth video frame to save CPU
-static NSInteger const kFaceCheckInterval = 5;
-
-// If no face is found within this time, capture anyway as fallback
-static NSTimeInterval const kFaceDetectionFallbackTimeout = 10.0;
 
 @interface ScannerViewController () <CameraManagerDelegate, BarcodeDecoderDelegate, FaceDetectorHelperDelegate>
 
@@ -49,7 +44,10 @@ static NSTimeInterval const kFaceDetectionFallbackTimeout = 10.0;
 // Face detection state (front scan)
 @property (nonatomic, assign) BOOL frontFaceDetected;
 @property (nonatomic, assign) BOOL frontCaptureTriggered;
-@property (nonatomic, assign) NSInteger faceCheckCounter;
+// Guard: prevents launching a new still capture while one is in flight
+@property (nonatomic, assign) BOOL faceCapturePending;
+// Incremented on every new front scan — orphaned retry blocks check this and bail out
+@property (nonatomic, assign) NSInteger frontScanGeneration;
 
 // Options
 @property (nonatomic, assign) BOOL captureFullImages;
@@ -66,7 +64,6 @@ static NSTimeInterval const kFaceDetectionFallbackTimeout = 10.0;
 
 // Timers
 @property (nonatomic, strong) NSTimer *timeoutTimer;
-@property (nonatomic, strong) NSTimer *faceFallbackTimer;
 
 @end
 
@@ -80,7 +77,8 @@ static NSTimeInterval const kFaceDetectionFallbackTimeout = 10.0;
     self.isDismissing = NO;
     self.frontFaceDetected = NO;
     self.frontCaptureTriggered = NO;
-    self.faceCheckCounter = 0;
+    self.faceCapturePending = NO;
+    self.frontScanGeneration = 0;
 
     [self parseOptions];
     [self setupUI];
@@ -533,16 +531,19 @@ static NSTimeInterval const kFaceDetectionFallbackTimeout = 10.0;
 #pragma mark - Scan Flow
 
 - (void)startFrontScan {
-    NSLog(@"[ScannerVC] Starting front scan with face detection");
+    NSLog(@"[ScannerVC] Starting front scan");
 
     self.frontFaceDetected = NO;
     self.frontCaptureTriggered = NO;
-    self.faceCheckCounter = 0;
+    self.faceCapturePending = NO;
+    // Incrementing generation invalidates all dispatch_after blocks from any previous scan.
+    self.frontScanGeneration++;
+    NSInteger myGeneration = self.frontScanGeneration;
 
-    // Enable video frames so we can detect faces before capturing
-    [self.cameraManager startCameraWithBarcodeScanning:YES];
+    // No barcode scanning needed during front scan.
+    [self.cameraManager startCameraWithBarcodeScanning:NO];
 
-    // Overall timeout: fail if front scan takes too long
+    // Overall timeout
     __weak __typeof(self) weakSelf = self;
     [self startTimeoutWithHandler:^{
         __strong __typeof(weakSelf) strongSelf = weakSelf;
@@ -551,22 +552,30 @@ static NSTimeInterval const kFaceDetectionFallbackTimeout = 10.0;
         }
     }];
 
-    // Face detection fallback: if no face found after N seconds, capture anyway
-    self.faceFallbackTimer = [NSTimer scheduledTimerWithTimeInterval:kFaceDetectionFallbackTimeout
-                                                             repeats:NO
-                                                               block:^(NSTimer *timer) {
+    // After 1s warmup (autofocus/exposure settle), start periodic still captures.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
         __strong __typeof(weakSelf) strongSelf = weakSelf;
-        if (strongSelf && !strongSelf.isDismissing
-            && strongSelf.currentState == ScanStateScanningFront
-            && !strongSelf.frontCaptureTriggered) {
-            NSLog(@"[ScannerVC] Face fallback: capturing without face detection");
-            strongSelf.frontCaptureTriggered = YES;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                strongSelf.statusLabel.text = @"Capturing...";
-            });
-            [strongSelf.cameraManager captureImage];
+        if (strongSelf && strongSelf.frontScanGeneration == myGeneration) {
+            [strongSelf tryFrontFaceCapture];
         }
-    }];
+    });
+}
+
+// Captures a still image for face detection. Called on main thread.
+// If no face is found, schedules itself again after 1.5s.
+- (void)tryFrontFaceCapture {
+    if (self.isDismissing
+            || self.currentState != ScanStateScanningFront
+            || self.frontCaptureTriggered
+            || self.faceCapturePending) {
+        return;
+    }
+
+    NSLog(@"[ScannerVC] Capturing still for face detection");
+    self.faceCapturePending = YES;
+    self.statusLabel.text = @"Looking for face...";
+    [self.cameraManager captureImage];
 }
 
 - (void)showFlipInstruction {
@@ -694,54 +703,6 @@ static NSTimeInterval const kFaceDetectionFallbackTimeout = 10.0;
     [self cancelAllTimers];
 }
 
-#pragma mark - Face Detection on Video Frames
-
-- (void)checkForFaceInSampleBuffer:(CMSampleBufferRef)sampleBuffer {
-    // Throttle: check every Nth frame
-    self.faceCheckCounter++;
-    if (self.faceCheckCounter % kFaceCheckInterval != 0) {
-        return;
-    }
-
-    CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-    if (!pixelBuffer) {
-        return;
-    }
-
-    // Run Vision face detection synchronously (fast for rectangles only)
-    VNDetectFaceRectanglesRequest *request = [[VNDetectFaceRectanglesRequest alloc] init];
-    VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pixelBuffer
-                                                                              orientation:kCGImagePropertyOrientationRight
-                                                                                  options:@{}];
-
-    NSError *error = nil;
-    [handler performRequests:@[request] error:&error];
-
-    if (error) {
-        return;
-    }
-
-    if (request.results.count > 0) {
-        NSLog(@"[ScannerVC] Face detected in video frame (%lu face(s))", (unsigned long)request.results.count);
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (self.isDismissing || self.currentState != ScanStateScanningFront || self.frontCaptureTriggered) {
-                return;
-            }
-
-            self.frontFaceDetected = YES;
-            self.frontCaptureTriggered = YES;
-
-            // Visual feedback
-            self.statusLabel.text = @"Face detected! Capturing...";
-            self.scanFrame.layer.borderColor = [UIColor colorWithRed:0 green:0.78 blue:0.33 alpha:1.0].CGColor;
-
-            // Capture the front image
-            [self.cameraManager captureImage];
-        });
-    }
-}
-
 #pragma mark - Button Actions
 
 - (void)toggleFlash {
@@ -778,8 +739,6 @@ static NSTimeInterval const kFaceDetectionFallbackTimeout = 10.0;
 - (void)cancelAllTimers {
     [self.timeoutTimer invalidate];
     self.timeoutTimer = nil;
-    [self.faceFallbackTimer invalidate];
-    self.faceFallbackTimer = nil;
 }
 
 #pragma mark - CameraManagerDelegate
@@ -790,20 +749,16 @@ static NSTimeInterval const kFaceDetectionFallbackTimeout = 10.0;
           NSStringFromCGSize(image.size));
 
     if (self.currentState == ScanStateScanningFront) {
-        // Normalize orientation so face detection and portrait cropping work correctly.
-        // Camera photos have imageOrientation != Up (typically Right for portrait),
-        // which causes coordinate mismatches between Vision bounding boxes
-        // (relative to raw CGImage pixels) and crop rects (computed from UIImage.size).
         self.frontImage = [ImageUtils normalizeOrientation:image];
-        NSLog(@"[ScannerVC] Front image normalized: size=%@, CGImage=%zux%zu",
-              NSStringFromCGSize(self.frontImage.size),
-              CGImageGetWidth(self.frontImage.CGImage),
-              CGImageGetHeight(self.frontImage.CGImage));
+        NSLog(@"[ScannerVC] Front still captured: %@", NSStringFromCGSize(self.frontImage.size));
 
-        // Extract portrait from the captured image
         if (self.extractPortrait) {
+            // Run Vision face detection on the full-resolution still.
+            // If face found  → faceDetectorHelper:didDetectFace: → save portrait → flip
+            // If not found   → faceDetectorHelperDidNotDetectFace: → retry after 1.5s
             [self.faceDetector detectFaceInImage:self.frontImage];
         } else {
+            self.frontCaptureTriggered = YES;
             [self transitionToState:ScanStateFlipInstruction];
         }
     } else if (self.currentState == ScanStateScanningBack) {
@@ -813,12 +768,8 @@ static NSTimeInterval const kFaceDetectionFallbackTimeout = 10.0;
 
 - (void)cameraManager:(CameraManager *)manager didReceiveSampleBuffer:(CMSampleBufferRef)sampleBuffer {
     // Called on the video queue — must be thread-safe
-
-    if (self.currentState == ScanStateScanningFront && !self.frontCaptureTriggered) {
-        // Front scan: detect face in video frames
-        [self checkForFaceInSampleBuffer:sampleBuffer];
-    } else if (self.currentState == ScanStateScanningBack) {
-        // Back scan: decode barcode
+    // Front scan: face detection uses periodic stills, not video frames.
+    if (self.currentState == ScanStateScanningBack) {
         [self.barcodeDecoder decodeSampleBuffer:sampleBuffer];
     }
 }
@@ -934,28 +885,44 @@ static NSTimeInterval const kFaceDetectionFallbackTimeout = 10.0;
 #pragma mark - FaceDetectorHelperDelegate
 
 - (void)faceDetectorHelper:(FaceDetectorHelper *)helper didDetectFace:(UIImage *)croppedFace {
-    NSLog(@"[ScannerVC] Face detected and cropped from captured photo");
+    NSLog(@"[ScannerVC] Face detected — advancing to flip");
     self.portraitImage = croppedFace;
+    self.frontCaptureTriggered = YES;
 
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!self.isDismissing && self.currentState == ScanStateScanningFront) {
+            self.statusLabel.text = @"Face detected!";
+            self.scanFrame.layer.borderColor =
+                [UIColor colorWithRed:0 green:0.78 blue:0.33 alpha:1.0].CGColor;
             [self transitionToState:ScanStateFlipInstruction];
         }
     });
 }
 
 - (void)faceDetectorHelperDidNotDetectFace:(FaceDetectorHelper *)helper {
-    NSLog(@"[ScannerVC] No face in captured photo, using deterministic crop");
+    NSLog(@"[ScannerVC] No face in still — retrying in 1.5s");
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!self.isDismissing && self.currentState == ScanStateScanningFront) {
-            [self transitionToState:ScanStateFlipInstruction];
-        }
+        if (self.isDismissing || self.currentState != ScanStateScanningFront) return;
+        self.faceCapturePending = NO;
+        self.statusLabel.text = @"Hold license steady...";
+
+        // Capture current generation so this retry block won't fire in a future scan.
+        NSInteger myGeneration = self.frontScanGeneration;
+        __weak __typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            __strong __typeof(weakSelf) strongSelf = weakSelf;
+            if (strongSelf && strongSelf.frontScanGeneration == myGeneration) {
+                [strongSelf tryFrontFaceCapture];
+            }
+        });
     });
 }
 
 - (void)faceDetectorHelper:(FaceDetectorHelper *)helper didFailWithError:(NSError *)error {
-    NSLog(@"[ScannerVC] Face detection error: %@", error);
+    NSLog(@"[ScannerVC] Face detection error (will retry): %@", error);
+    [self faceDetectorHelperDidNotDetectFace:helper];
 
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!self.isDismissing && self.currentState == ScanStateScanningFront) {

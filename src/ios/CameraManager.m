@@ -285,19 +285,17 @@ static NSInteger const kAutoTorchFrameThreshold = 45;
             return;
         }
 
-        // Configure video output delegate (for ZXingObjC fallback + face detection)
-        if (enableBarcodeScanning) {
-            [self.videoOutput setSampleBufferDelegate:self queue:self.videoQueue];
-        } else {
-            [self.videoOutput setSampleBufferDelegate:nil queue:nil];
-        }
+        // Video frames are always needed: for ZXingObjC barcode fallback during back scan
+        // AND for Vision face detection during front scan.
+        [self.videoOutput setSampleBufferDelegate:self queue:self.videoQueue];
 
-        // Configure native metadata output delegate (primary PDF417 detector)
+        // Native PDF417 metadata output — only needed during back scan.
         if (enableBarcodeScanning) {
             [self.metadataOutput setMetadataObjectsDelegate:self queue:dispatch_get_main_queue()];
             NSLog(@"[CameraManager] Native PDF417 metadata delegate enabled");
         } else {
             [self.metadataOutput setMetadataObjectsDelegate:nil queue:nil];
+            NSLog(@"[CameraManager] Native PDF417 metadata delegate disabled (front scan)");
         }
 
         if (!self.captureSession.isRunning) {
