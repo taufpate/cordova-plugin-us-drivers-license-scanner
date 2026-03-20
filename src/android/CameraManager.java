@@ -99,6 +99,10 @@ public class CameraManager {
     private PreviewView previewView; // non-final: updated when layout re-inflates on orientation change
     private final ScanCallback callback;
     private final ExecutorService cameraExecutor;
+    // Separate executor for preview-based scan processing (crop/upscale/sharpen/ZXing).
+    // Must NOT share cameraExecutor: CameraX ImageAnalysis and our preview tasks compete
+    // on a SingleThreadExecutor, causing 80%+ of preview ML Kit submissions to be blocked.
+    private final ExecutorService scanExecutor;
     private final BarcodeAnalyzer zxingAnalyzer;
 
     // ML Kit barcode scanner — primary decoder for ImageAnalysis frames, PDF417 only
@@ -166,6 +170,7 @@ public class CameraManager {
         this.previewView = previewView;
         this.callback = callback;
         this.cameraExecutor = Executors.newSingleThreadExecutor();
+        this.scanExecutor = Executors.newSingleThreadExecutor();
         this.zxingAnalyzer = new BarcodeAnalyzer(this::onBarcodeResult);
 
         // Initialize ML Kit barcode scanner — PDF417 ONLY.
@@ -219,13 +224,13 @@ public class CameraManager {
                 cameraProvider = cameraProviderFuture.get();
                 bindCameraUseCases();
                 isCameraRunning = true;
-                // Apply a gentle zoom immediately after binding so the barcode fills more
-                // of the frame. Done here (not with postDelayed) so there is no visible
-                // transition — the user never sees the un-zoomed state.
+                // No zoom applied — the crop+upscale pipeline provides sufficient
+                // resolution per barcode module without requiring the user to hold
+                // the phone far from the card. linearZoom(0.0f) = native field of view.
                 if (enableBarcodeScanning && camera != null) {
-                    camera.getCameraControl().setLinearZoom(0.25f);
-                    currentZoom = 0.25f;
-                    Log.w(TAG, "Initial zoom 0.25f applied for barcode scan");
+                    camera.getCameraControl().setLinearZoom(0.0f);
+                    currentZoom = 0.0f;
+                    Log.w(TAG, "Zoom reset to 0.0f (no zoom) for barcode scan");
                 }
                 Log.w(TAG, "Camera started successfully, barcodeScanning=" + isBarcodeScanning);
             } catch (ExecutionException | InterruptedException e) {
@@ -257,6 +262,10 @@ public class CameraManager {
 
         if (cameraExecutor != null && !cameraExecutor.isShutdown()) {
             cameraExecutor.shutdown();
+        }
+
+        if (scanExecutor != null && !scanExecutor.isShutdown()) {
+            scanExecutor.shutdown();
         }
 
         if (zxingAnalyzer != null) {
@@ -442,8 +451,16 @@ public class CameraManager {
 
     /**
      * Handles ML Kit barcode results.
-     * Accepts ANY barcode — no AAMVA validation filtering.
-     * Also tries getRawBytes() as fallback when getRawValue() is null.
+     *
+     * IMPORTANT: Only PDF417 barcodes are accepted. US driver licenses also have a 1D
+     * barcode on the back (CODE-128 with the license number). The ALL_FORMATS diagnostic
+     * scanner detects both — if the 1D barcode is reported first, the AAMVA parser
+     * receives a short non-AAMVA string and returns "unknown" fields.
+     *
+     * Acceptance rules:
+     * - FORMAT_PDF417: always accepted
+     * - FORMAT_UNKNOWN (0): accepted only if data looks like AAMVA (has "@" header or field codes)
+     * - All other 1D/2D formats: logged and skipped
      */
     private void handleMLKitBarcodes(List<Barcode> barcodes) {
         if (barcodes == null || barcodes.isEmpty() || barcodeFound) {
@@ -452,11 +469,24 @@ public class CameraManager {
 
         for (Barcode barcode : barcodes) {
             int format = barcode.getFormat();
+
+            // Reject non-PDF417 barcodes — 1D barcodes (CODE-128, CODE-39, etc.) on the
+            // back of the license card must not be mistaken for the AAMVA PDF417.
+            if (format != Barcode.FORMAT_PDF417 && format != Barcode.FORMAT_UNKNOWN) {
+                Log.w(TAG, "Ignoring non-PDF417 barcode: " + barcodeFormatName(format));
+                continue;
+            }
+
             String rawValue = barcode.getRawValue();
 
             // Try rawValue first
             if (rawValue != null && !rawValue.isEmpty()) {
-                Log.w(TAG, "ML Kit barcode! format=" + format
+                // For FORMAT_UNKNOWN, require AAMVA markers to avoid false positives
+                if (format == Barcode.FORMAT_UNKNOWN && !looksLikeAamva(rawValue)) {
+                    Log.w(TAG, "FORMAT_UNKNOWN barcode rejected (no AAMVA markers): len=" + rawValue.length());
+                    continue;
+                }
+                Log.w(TAG, "ML Kit barcode! format=" + barcodeFormatName(format)
                         + " len=" + rawValue.length()
                         + " preview=" + rawValue.substring(0, Math.min(50, rawValue.length())));
                 reportBarcode(rawValue);
@@ -468,7 +498,11 @@ public class CameraManager {
             if (rawBytes != null && rawBytes.length > 0) {
                 String fromBytes = new String(rawBytes, StandardCharsets.ISO_8859_1);
                 if (!fromBytes.isEmpty()) {
-                    Log.w(TAG, "ML Kit barcode (bytes)! format=" + format
+                    if (format == Barcode.FORMAT_UNKNOWN && !looksLikeAamva(fromBytes)) {
+                        Log.w(TAG, "FORMAT_UNKNOWN bytes barcode rejected (no AAMVA markers)");
+                        continue;
+                    }
+                    Log.w(TAG, "ML Kit barcode (bytes)! format=" + barcodeFormatName(format)
                             + " len=" + fromBytes.length());
                     reportBarcode(fromBytes);
                     return;
@@ -478,12 +512,31 @@ public class CameraManager {
             // Last resort: displayValue
             String displayValue = barcode.getDisplayValue();
             if (displayValue != null && !displayValue.isEmpty()) {
-                Log.w(TAG, "ML Kit barcode (display)! format=" + format
+                if (format == Barcode.FORMAT_UNKNOWN && !looksLikeAamva(displayValue)) {
+                    Log.w(TAG, "FORMAT_UNKNOWN display barcode rejected (no AAMVA markers)");
+                    continue;
+                }
+                Log.w(TAG, "ML Kit barcode (display)! format=" + barcodeFormatName(format)
                         + " len=" + displayValue.length());
                 reportBarcode(displayValue);
                 return;
             }
         }
+    }
+
+    /**
+     * Quick check: does this string look like AAMVA driver license data?
+     * Used to validate FORMAT_UNKNOWN results from the ALL_FORMATS diagnostic scanner.
+     */
+    private boolean looksLikeAamva(String data) {
+        if (data == null || data.length() < 10) return false;
+        return data.startsWith("@")
+                || data.contains("ANSI ")
+                || data.contains("AAMVA")
+                || data.contains("DAQ")   // license number field
+                || data.contains("DCS")   // last name
+                || data.contains("DAC")   // first name
+                || data.contains("DBB");  // date of birth
     }
 
     /**
@@ -578,31 +631,54 @@ public class CameraManager {
         return lastMlKitResultCount;
     }
 
+    /**
+     * Converts an ImageProxy to a correctly-rotated Bitmap.
+     *
+     * Handles two formats:
+     * - JPEG (ImageCapture.OnImageCapturedCallback): 1 plane, direct JPEG bytes.
+     * - YUV_420_888 (ImageAnalysis): 3 planes, converted via NV21→JPEG→Bitmap.
+     *
+     * ImageCapture always delivers JPEG. ImageAnalysis always delivers YUV_420_888.
+     * Accessing planes[1]/[2] on a JPEG image throws ArrayIndexOutOfBoundsException,
+     * which was silently swallowed and caused the capture callback to never fire.
+     */
     @OptIn(markerClass = ExperimentalGetImage.class)
     private Bitmap imageProxyToBitmap(ImageProxy imageProxy) {
         Image image = imageProxy.getImage();
         if (image == null) return null;
 
+        Bitmap bitmap;
         Image.Plane[] planes = image.getPlanes();
-        ByteBuffer yBuffer = planes[0].getBuffer();
-        ByteBuffer uBuffer = planes[1].getBuffer();
-        ByteBuffer vBuffer = planes[2].getBuffer();
 
-        int ySize = yBuffer.remaining();
-        int uSize = uBuffer.remaining();
-        int vSize = vBuffer.remaining();
+        if (image.getFormat() == ImageFormat.JPEG || planes.length == 1) {
+            // JPEG format (from ImageCapture) — single plane contains raw JPEG bytes
+            ByteBuffer buffer = planes[0].getBuffer();
+            byte[] bytes = new byte[buffer.remaining()];
+            buffer.get(bytes);
+            bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+        } else {
+            // YUV_420_888 format (from ImageAnalysis) — convert via NV21
+            ByteBuffer yBuffer = planes[0].getBuffer();
+            ByteBuffer uBuffer = planes[1].getBuffer();
+            ByteBuffer vBuffer = planes[2].getBuffer();
 
-        byte[] nv21 = new byte[ySize + uSize + vSize];
-        yBuffer.get(nv21, 0, ySize);
-        vBuffer.get(nv21, ySize, vSize);
-        uBuffer.get(nv21, ySize + vSize, uSize);
+            int ySize = yBuffer.remaining();
+            int uSize = uBuffer.remaining();
+            int vSize = vBuffer.remaining();
 
-        YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21, image.getWidth(), image.getHeight(), null);
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        yuvImage.compressToJpeg(new Rect(0, 0, image.getWidth(), image.getHeight()), 90, out);
+            byte[] nv21 = new byte[ySize + uSize + vSize];
+            yBuffer.get(nv21, 0, ySize);
+            vBuffer.get(nv21, ySize, vSize);
+            uBuffer.get(nv21, ySize + vSize, uSize);
 
-        byte[] jpegBytes = out.toByteArray();
-        Bitmap bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
+            YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21, image.getWidth(), image.getHeight(), null);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            yuvImage.compressToJpeg(new Rect(0, 0, image.getWidth(), image.getHeight()), 90, out);
+            byte[] jpegBytes = out.toByteArray();
+            bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
+        }
+
+        if (bitmap == null) return null;
 
         int rotation = imageProxy.getImageInfo().getRotationDegrees();
         if (rotation != 0) {
@@ -621,16 +697,9 @@ public class CameraManager {
      * Uses PreviewView.getBitmap() which is device-independent and always correctly
      * rotated. This bypasses the ImageAnalysis pipeline entirely.
      *
-     * The preview bitmap is cropped to the center region where the barcode should be
-     * and upscaled 2x to increase the number of pixels per barcode module.
-     * At 720px screen width, a PDF417 with 510 modules at 60% fill gives ~0.85 px/module.
-     * After crop+upscale, this doubles to ~1.7 px/module. Combined with camera zoom
-     * (which fills more of the frame), we reach the required 2+ px/module threshold.
-     *
-     * Submitted to:
-     * 1. ML Kit PDF417 (async) — primary decoder, on cropped+upscaled image
-     * 2. ZXing PDF417Reader (background thread) — fallback with strategy rotation
-     * 3. ML Kit ALL_FORMATS (every 10th scan) — diagnostic
+     * THREADING: PreviewView.getBitmap() must be called on the UI thread. All heavy
+     * processing (crop, upscale, sharpen, ML Kit, ZXing) is dispatched to the
+     * cameraExecutor background thread to keep the UI thread free and prevent jank.
      *
      * Must be called from the main (UI) thread.
      *
@@ -639,6 +708,7 @@ public class CameraManager {
     public int scanPreviewForBarcode() {
         if (barcodeFound) return -1;
 
+        // getBitmap() must be called on the UI thread — do it here before dispatching.
         Bitmap fullBitmap = previewView.getBitmap();
         if (fullBitmap == null) {
             Log.w(TAG, "scanPreviewForBarcode: preview bitmap null");
@@ -646,8 +716,9 @@ public class CameraManager {
         }
 
         framesSinceLastDetection++;
+        final int scanNum = framesSinceLastDetection;
 
-        // Auto-torch check
+        // Auto-torch check (UI thread, lightweight)
         if (!autoTorchActive && framesSinceLastDetection >= AUTO_TORCH_FRAME_THRESHOLD) {
             autoTorchActive = true;
             enableAutoTorch();
@@ -661,62 +732,73 @@ public class CameraManager {
                     + " zxingSub=" + zxingSubmitted);
         }
 
-        // Crop center barcode region and upscale 2x for better per-module resolution.
-        // The PDF417 barcode on a US license back is typically in the center area of the frame.
-        Bitmap scanBitmap = cropAndUpscaleForBarcode(fullBitmap);
+        // Grab a second bitmap for the ALL_FORMATS diagnostic (every 20 scans) on the UI thread
+        // before dispatching, since getBitmap() requires the UI thread.
+        final boolean runDiag = (scanNum % 20 == 5) && !barcodeFound;
+        final Bitmap diagBitmap = runDiag ? previewView.getBitmap() : null;
 
-        // Make a copy for ZXing (runs on background thread in parallel)
-        Bitmap zxingCopy = null;
-        try {
-            zxingCopy = scanBitmap.copy(scanBitmap.getConfig(), false);
-        } catch (Exception e) {
-            Log.w(TAG, "Failed to copy bitmap for ZXing: " + e.getMessage());
-        }
+        // Dispatch all heavy processing to scanExecutor (dedicated thread, NOT cameraExecutor).
+        // Using cameraExecutor here caused 80%+ of ML Kit submissions to be blocked because
+        // CameraX ImageAnalysis continuously queues tasks on that same single-thread executor.
+        scanExecutor.execute(() -> {
+            if (barcodeFound) {
+                fullBitmap.recycle();
+                if (diagBitmap != null) diagBitmap.recycle();
+                return;
+            }
 
-        // 1. ML Kit PDF417 — uses SEPARATE scanner instance (previewMlKitScanner) to avoid
-        //    contention with ImageAnalysis path. Testing showed the shared lock caused the
-        //    preview path to be starved (pvSub=7/24 vs iaSub=69).
-        if (previewMlKitProcessing.compareAndSet(false, true)) {
-            previewMlKitSubmitted++;
-            InputImage inputImage = InputImage.fromBitmap(scanBitmap, 0);
-            previewMlKitScanner.process(inputImage)
-                    .addOnSuccessListener(barcodes -> {
-                        previewMlKitProcessing.set(false);
-                        lastMlKitResultCount = barcodes != null ? barcodes.size() : 0;
-                        handleMLKitBarcodes(barcodes);
-                    })
-                    .addOnFailureListener(e -> {
-                        previewMlKitProcessing.set(false);
-                        lastMlKitError = e.getMessage() != null ? e.getMessage() : "unknown";
-                        Log.w(TAG, "ML Kit preview error: " + lastMlKitError);
-                    })
-                    .addOnCompleteListener(task -> {
-                        if (!scanBitmap.isRecycled()) scanBitmap.recycle();
-                    });
-        } else {
-            previewMlKitBlocked++;
-            scanBitmap.recycle();
-        }
+            // Crop center barcode region and upscale for better per-module resolution.
+            Bitmap scanBitmap = cropAndUpscaleForBarcode(fullBitmap);
+            fullBitmap.recycle();
 
-        // 2. ZXing on background thread (strategy rotation handles blurry/worn barcodes)
-        if (zxingCopy != null && !barcodeFound) {
-            final Bitmap zxBmp = zxingCopy;
-            zxingSubmitted++;
-            cameraExecutor.execute(() -> {
-                zxingAnalyzer.analyze(zxBmp);
-                if (!zxBmp.isRecycled()) zxBmp.recycle();
-            });
-        } else if (zxingCopy != null) {
-            zxingCopy.recycle();
-        }
+            // Make a copy for ZXing (runs synchronously after ML Kit is submitted)
+            Bitmap zxingCopy = null;
+            try {
+                zxingCopy = scanBitmap.copy(scanBitmap.getConfig(), false);
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to copy bitmap for ZXing: " + e.getMessage());
+            }
 
-        // 3. Diagnostic: ALL_FORMATS check every 10th scan (on cropped+upscaled image)
-        if (framesSinceLastDetection % 10 == 5 && !barcodeFound) {
-            Bitmap diagSource = previewView.getBitmap();
-            if (diagSource != null) {
-                Bitmap diagBmp = cropAndUpscaleForBarcode(diagSource);
-                diagSource.recycle();
-                InputImage diagInput = InputImage.fromBitmap(diagBmp, 0);
+            // 1. ML Kit PDF417 — uses SEPARATE scanner instance to avoid contention
+            //    with ImageAnalysis path. Reset flag unconditionally before submit so a
+            //    previously stuck AtomicBoolean doesn't permanently block this path.
+            previewMlKitProcessing.set(false);
+            if (previewMlKitProcessing.compareAndSet(false, true)) {
+                previewMlKitSubmitted++;
+                InputImage inputImage = InputImage.fromBitmap(scanBitmap, 0);
+                previewMlKitScanner.process(inputImage)
+                        .addOnSuccessListener(barcodes -> {
+                            previewMlKitProcessing.set(false);
+                            lastMlKitResultCount = barcodes != null ? barcodes.size() : 0;
+                            handleMLKitBarcodes(barcodes);
+                        })
+                        .addOnFailureListener(e -> {
+                            previewMlKitProcessing.set(false);
+                            lastMlKitError = e.getMessage() != null ? e.getMessage() : "unknown";
+                            Log.w(TAG, "ML Kit preview error: " + lastMlKitError);
+                        })
+                        .addOnCompleteListener(task -> {
+                            if (!scanBitmap.isRecycled()) scanBitmap.recycle();
+                        });
+            } else {
+                previewMlKitBlocked++;
+                scanBitmap.recycle();
+            }
+
+            // 2. ZXing fallback (strategy rotation handles blurry/worn barcodes)
+            if (zxingCopy != null && !barcodeFound) {
+                zxingSubmitted++;
+                zxingAnalyzer.analyze(zxingCopy);
+                if (!zxingCopy.isRecycled()) zxingCopy.recycle();
+            } else if (zxingCopy != null) {
+                zxingCopy.recycle();
+            }
+
+            // 3. ALL_FORMATS diagnostic every 20 scans — catches barcodes missed by PDF417 scanner
+            if (diagBitmap != null && !barcodeFound) {
+                Bitmap diagCropped = cropAndUpscaleForBarcode(diagBitmap);
+                diagBitmap.recycle();
+                InputImage diagInput = InputImage.fromBitmap(diagCropped, 0);
                 diagnosticScanner.process(diagInput)
                         .addOnSuccessListener(barcodes -> {
                             lastDiagnosticCount = barcodes != null ? barcodes.size() : 0;
@@ -729,21 +811,21 @@ public class CameraManager {
                                     sb.append(",");
                                 }
                                 lastDiagnosticFormats = sb.toString();
-                                Log.w(TAG, "DIAGNOSTIC: found " + barcodes.size()
-                                        + " barcodes: " + lastDiagnosticFormats);
+                                Log.w(TAG, "DIAG: " + barcodes.size() + " barcodes: " + lastDiagnosticFormats);
                                 handleMLKitBarcodes(barcodes);
                             } else {
                                 lastDiagnosticFormats = "none";
                             }
                         })
-                        .addOnFailureListener(e -> {
-                            lastDiagnosticFormats = "err:" + e.getMessage();
-                        })
-                        .addOnCompleteListener(task -> diagBmp.recycle());
+                        .addOnFailureListener(e -> lastDiagnosticFormats = "err:" + e.getMessage())
+                        .addOnCompleteListener(task -> {
+                            if (!diagCropped.isRecycled()) diagCropped.recycle();
+                        });
+            } else if (diagBitmap != null) {
+                diagBitmap.recycle();
             }
-        }
+        });
 
-        fullBitmap.recycle();
         return framesSinceLastDetection;
     }
 

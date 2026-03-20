@@ -59,9 +59,10 @@ public class FaceDetectorHelper {
     /**
      * Callback interface for live video face presence detection.
      * Used during front scan to trigger auto-capture when a face is visible.
+     * croppedFace is non-null only when faceFound=true and a valid crop could be extracted.
      */
     public interface LiveFaceCallback {
-        void onFacePresenceDetected(boolean faceFound);
+        void onFacePresenceDetected(boolean faceFound, Bitmap croppedFace);
     }
 
     private final Context context;
@@ -152,7 +153,7 @@ public class FaceDetectorHelper {
      */
     public void checkForFacePresence(Bitmap bitmap, LiveFaceCallback liveFaceCallback) {
         if (bitmap == null || bitmap.isRecycled()) {
-            liveFaceCallback.onFacePresenceDetected(false);
+            liveFaceCallback.onFacePresenceDetected(false, null);
             return;
         }
 
@@ -164,11 +165,22 @@ public class FaceDetectorHelper {
                 .addOnSuccessListener(faces -> {
                     boolean found = faces != null && !faces.isEmpty();
                     Log.d(TAG, "Live face check result: " + (found ? faces.size() + " face(s) FOUND" : "no faces"));
-                    liveFaceCallback.onFacePresenceDetected(found);
+                    Bitmap cropped = null;
+                    if (found) {
+                        // Extract the portrait crop right here using the same bitmap and bounding boxes.
+                        // This avoids a second detection pass with a different detector later.
+                        Face bestFace = findBestFace(bitmap, faces);
+                        if (bestFace != null) {
+                            cropped = extractFaceRegion(bitmap, bestFace);
+                            Log.d(TAG, "Live crop result: " + (cropped != null
+                                    ? cropped.getWidth() + "x" + cropped.getHeight() : "null"));
+                        }
+                    }
+                    liveFaceCallback.onFacePresenceDetected(found, cropped);
                 })
                 .addOnFailureListener(e -> {
                     Log.w(TAG, "Live face detection failed: " + e.getMessage(), e);
-                    liveFaceCallback.onFacePresenceDetected(false);
+                    liveFaceCallback.onFacePresenceDetected(false, null);
                 });
     }
 

@@ -58,13 +58,10 @@ public class ScannerActivity extends AppCompatActivity implements
 
     private static final String TAG = "ScannerActivity";
 
-    // Face detection runs every Nth delivered video frame (matches iOS kFaceCheckInterval = 5)
-    private static final int FACE_CHECK_INTERVAL = 5;
-
-    // If no face is found within this time, capture anyway.
-    // ML Kit is less sensitive than iOS Vision for small printed faces on licenses,
-    // so we use a shorter timeout (3s) to avoid making the user wait.
-    private static final long FACE_FALLBACK_TIMEOUT_MS = 3000;
+    // Interval for preview-based face detection (ms)
+    // Uses previewView.getBitmap() (720x1600) — NOT ImageAnalysis frames (720x720 square,
+    // too small for reliable printed-face detection on driver licenses).
+    private static final long FACE_SCAN_INTERVAL_MS = 500;
 
     // Interval for preview-based barcode scanning (ms)
     private static final long BARCODE_SCAN_INTERVAL_MS = 500;
@@ -109,9 +106,11 @@ public class ScannerActivity extends AppCompatActivity implements
     private ScanState currentState = ScanState.SCANNING_FRONT;
     private boolean isFlashOn = false;
 
-    // Face detection state (front scan) — matches iOS ScannerViewController
+    // Face detection state (front scan)
     private boolean frontCaptureTriggered = false;
-    private int faceCheckCounter = 0;
+    // Guard: prevents concurrent ML Kit face detection submissions
+    private final java.util.concurrent.atomic.AtomicBoolean faceDetecting =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
 
     // Scan results storage
     private Bitmap frontImage;
@@ -121,9 +120,9 @@ public class ScannerActivity extends AppCompatActivity implements
     private String backRawData;
     private JSONObject parsedFields;
 
-    // Timeout handlers
+    // Timeout/scan handlers
     private Runnable timeoutRunnable;
-    private Runnable faceFallbackRunnable;
+    private Runnable faceScanRunnable;
     private Runnable barcodeScanRunnable;
     private int previewScanCount = 0;
 
@@ -261,7 +260,7 @@ public class ScannerActivity extends AppCompatActivity implements
         switch (state) {
             case SCANNING_FRONT:
                 instructionText.setText("Position the FRONT of your driver license");
-                statusText.setText("Looking for license photo...");
+                statusText.setText("Hold steady — waiting for face detection...");
                 setOverlayColor(Color.WHITE);
                 break;
 
@@ -313,53 +312,93 @@ public class ScannerActivity extends AppCompatActivity implements
 
     /**
      * Starts the front side scanning process.
-     * Uses a timed auto-capture approach: the camera starts, and after
-     * FACE_FALLBACK_TIMEOUT_MS the front image is automatically grabbed from the preview.
-     * Face detection runs on the captured photo for portrait extraction.
+     *
+     * Face detection uses periodic scans of previewView.getBitmap() (720x1600 full frame)
+     * every FACE_SCAN_INTERVAL_MS. This approach was chosen because ImageAnalysis frames
+     * are delivered as 720x720 square crops on this device, which makes the printed face
+     * on the license too small for reliable ML Kit detection.
+     *
+     * The scan only advances when a face is actually detected — no timed auto-capture.
+     * The overall scanTimeoutMs still applies as safety net.
      */
     private void startFrontScan() {
-        Log.w(TAG, "Starting front scan (auto-capture in " + FACE_FALLBACK_TIMEOUT_MS + "ms)");
+        Log.w(TAG, "Starting front scan (preview-bitmap face detection)");
 
         frontCaptureTriggered = false;
-        faceCheckCounter = 0;
+        faceDetecting.set(false);
 
-        // Front scan is portrait-only: the user needs to see the card face and portrait photo.
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
 
-        // Start camera with face detection enabled on live video frames.
-        // Every 5th ImageAnalysis frame is fed to ML Kit face detection (checkForFacePresence).
-        // When a face is found, auto-capture fires immediately (matches iOS behavior).
-        // The 3-second faceFallbackRunnable below captures anyway if no face is detected.
-        cameraManager.startCamera(false, true);
+        // Start camera — preview + capture only (ImageAnalysis not needed for front scan).
+        // We use previewView.getBitmap() for face detection, same as barcode scanning.
+        cameraManager.startCamera(false, false);
 
-        // Overall timeout: fail if front scan takes too long
+        // Overall timeout: fail if no face detected within scanTimeoutMs
         startTimeout(() -> {
             if (currentState == ScanState.SCANNING_FRONT) {
-                finishWithError("SCAN_TIMEOUT", "Front scan timed out. Please try again.");
+                finishWithError("SCAN_TIMEOUT", "Could not detect a face. Position the FRONT of the license clearly in the frame.");
             }
         });
 
-        // Auto-capture after a short delay to let the user position the license.
-        // Grabs directly from PreviewView bitmap to avoid CameraX capture pipeline issues.
-        faceFallbackRunnable = () -> {
-            if (currentState == ScanState.SCANNING_FRONT && !frontCaptureTriggered) {
-                Log.w(TAG, "Auto-capture: grabbing front photo from preview");
-                frontCaptureTriggered = true;
-                statusText.setText("Capturing...");
+        // Start periodic face scan after 1s camera warmup
+        mainHandler.postDelayed(this::startFaceScanLoop, 1000);
+    }
 
-                // Try grabbing from preview first (most reliable)
-                Bitmap previewBitmap = previewView.getBitmap();
-                if (previewBitmap != null) {
-                    Log.w(TAG, "Got preview bitmap: " + previewBitmap.getWidth() + "x" + previewBitmap.getHeight());
-                    onImageCaptured(previewBitmap);
-                } else {
-                    // Fallback to CameraX capture if preview bitmap not available
-                    Log.w(TAG, "Preview bitmap null, falling back to CameraX capture");
-                    cameraManager.captureImage();
+    /**
+     * Runs a repeating face scan using previewView.getBitmap() every FACE_SCAN_INTERVAL_MS.
+     * When ML Kit detects a face, triggers the CameraX high-res capture for portrait extraction.
+     */
+    private void startFaceScanLoop() {
+        faceScanRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (currentState != ScanState.SCANNING_FRONT || frontCaptureTriggered) return;
+
+                Bitmap frame = previewView.getBitmap();
+                if (frame != null && faceDetecting.compareAndSet(false, true)) {
+                    faceDetector.checkForFacePresence(frame, (faceFound, croppedFace) -> {
+                        faceDetecting.set(false);
+
+                        if (faceFound && currentState == ScanState.SCANNING_FRONT
+                                && !frontCaptureTriggered) {
+                            Log.w(TAG, "Face detected in preview bitmap — triggering capture");
+                            frontCaptureTriggered = true;
+
+                            // Save portrait now from the live detection crop.
+                            // The live detector already found the correct bounding box — no need
+                            // for a second detection pass on the captured image later.
+                            if (extractPortrait && croppedFace != null) {
+                                portraitImage = croppedFace;
+                                Log.w(TAG, "Portrait saved from live detection: "
+                                        + croppedFace.getWidth() + "x" + croppedFace.getHeight());
+                            } else if (extractPortrait) {
+                                // Live detection found a face but crop failed — use deterministic crop
+                                // on the current frame as immediate fallback.
+                                portraitImage = FaceDetectorHelper.deterministicCrop(frame);
+                                Log.w(TAG, "Portrait fallback from deterministic crop on frame");
+                            }
+
+                            // Recycle frame only after we're done using it
+                            if (!frame.isRecycled()) frame.recycle();
+
+                            mainHandler.post(() -> {
+                                if (currentState == ScanState.SCANNING_FRONT) {
+                                    statusText.setText("Face detected! Capturing...");
+                                    cameraManager.captureImage();
+                                }
+                            });
+                        } else {
+                            if (!frame.isRecycled()) frame.recycle();
+                        }
+                    });
+                } else if (frame != null) {
+                    frame.recycle();
                 }
+
+                mainHandler.postDelayed(this, FACE_SCAN_INTERVAL_MS);
             }
         };
-        mainHandler.postDelayed(faceFallbackRunnable, FACE_FALLBACK_TIMEOUT_MS);
+        mainHandler.post(faceScanRunnable);
     }
 
     /**
@@ -426,11 +465,11 @@ public class ScannerActivity extends AppCompatActivity implements
     /**
      * Starts repeating preview-based barcode scanning.
      * Grabs PreviewView bitmap every BARCODE_SCAN_INTERVAL_MS and feeds to ML Kit.
-     * Also triggers autofocus periodically and saves debug data to files.
+     * Debug file I/O is dispatched to the background executor to avoid UI thread blocking.
      */
     private void startPreviewBarcodeScanning() {
-        // Clear previous debug files
-        clearDebugFiles();
+        // Clear previous debug files (background)
+        executorService.execute(this::clearDebugFiles);
 
         // Run self-test: generate a synthetic PDF417 and verify ML Kit can decode it
         cameraManager.runSelfTest();
@@ -441,25 +480,21 @@ public class ScannerActivity extends AppCompatActivity implements
                 if (currentState != ScanState.SCANNING_BACK) return;
 
                 try {
+                    int scanNum = cameraManager.scanPreviewForBarcode();
+                    previewScanCount++;
 
-                int scanNum = cameraManager.scanPreviewForBarcode();
-                previewScanCount++;
+                    // Capture debug bitmap on UI thread (getBitmap() requires UI thread),
+                    // then dispatch all I/O and stats computation to background.
+                    final int snapCount = previewScanCount;
+                    final boolean saveSnapshot = (snapCount == 5 || snapCount == 15 || snapCount == 25);
+                    final boolean computeStats = (snapCount % 5 == 0);
+                    Bitmap debugBmp = (saveSnapshot || computeStats) ? previewView.getBitmap() : null;
+                    executorService.execute(() -> writeDebugLog(debugBmp, snapCount, saveSnapshot));
 
-                // Write debug log every scan
-                writeDebugLog();
-
-                // Save preview bitmap at scans 5, 15, 25 (different focus states)
-                if (previewScanCount == 5 || previewScanCount == 15 || previewScanCount == 25) {
-                    saveDebugBitmap(previewScanCount);
-                }
-
-                // No manual AF calls — CameraX continuous AF handles focusing automatically.
-                // Manual AF calls caused focus hunting (sharpness drop from 26% to 0% between frames).
-
-                // Update status text periodically so the user knows scanning is active
-                if (previewScanCount % 10 == 0) {
-                    statusText.setText("Scanning barcode... keep steady");
-                }
+                    // Update status text periodically so the user knows scanning is active
+                    if (previewScanCount % 10 == 0) {
+                        statusText.setText("Scanning barcode... keep steady");
+                    }
 
                 } catch (Throwable t) {
                     Log.e(TAG, "Scan runnable error: " + t.getMessage(), t);
@@ -483,12 +518,12 @@ public class ScannerActivity extends AppCompatActivity implements
         } catch (Exception ignored) {}
     }
 
-    /** Saves a preview bitmap as JPEG to both internal and external storage. */
-    private void saveDebugBitmap(int scanNum) {
+    /**
+     * Saves a bitmap already captured on the UI thread as JPEG debug snapshot.
+     * Must be called on a background thread — does not recycle the bitmap (caller recycles).
+     */
+    private void saveDebugBitmapToFile(Bitmap bmp, int scanNum) {
         try {
-            Bitmap bmp = previewView.getBitmap();
-            if (bmp == null) return;
-
             // Internal storage
             File dir = getFilesDir();
             if (dir != null) {
@@ -506,32 +541,52 @@ public class ScannerActivity extends AppCompatActivity implements
                 bmp.compress(Bitmap.CompressFormat.JPEG, 95, fos2);
                 fos2.close();
             }
-
-            bmp.recycle();
         } catch (Exception e) {
             Log.w(TAG, "Debug bitmap save failed: " + e.getMessage());
         }
     }
 
-    /** Writes one line of debug data per scan to a text file. */
-    private void writeDebugLog() {
+    /** @deprecated Use saveDebugBitmapToFile via writeDebugLog instead. */
+    private void saveDebugBitmap(int scanNum) {
+        // no-op: replaced by saveDebugBitmapToFile called from writeDebugLog
+    }
+
+    /**
+     * Writes one line of debug data per scan to a text file.
+     * Must be called on a background thread. Accepts the preview bitmap captured on the
+     * UI thread so this method can do all heavy work (stats, file I/O) without blocking
+     * the camera preview.
+     *
+     * @param bmp       Preview bitmap captured on UI thread (may be null). Recycled here.
+     * @param scanCount Current scan count snapshot.
+     * @param save      Whether to also save the bitmap as a JPEG debug snapshot.
+     */
+    private void writeDebugLog(Bitmap bmp, int scanCount, boolean save) {
         try {
             File dir = getFilesDir();
-            if (dir == null) return;
-            File logFile = new File(dir, "scanner_debug.txt");
-            FileWriter fw = new FileWriter(logFile, true);
-            Bitmap bmp = previewView.getBitmap();
+            if (dir == null) {
+                if (bmp != null) bmp.recycle();
+                return;
+            }
+
             String dims = "null";
             String stats = "";
             if (bmp != null) {
                 dims = bmp.getWidth() + "x" + bmp.getHeight();
-                // Compute image quality stats every 5th scan
-                if (previewScanCount % 5 == 0) {
+                // Compute image quality stats every 5th scan (bulk getPixels, fast)
+                if (scanCount % 5 == 0) {
                     stats = "|" + computeImageStats(bmp);
+                }
+                // Save JPEG snapshot if requested
+                if (save) {
+                    saveDebugBitmapToFile(bmp, scanCount);
                 }
                 bmp.recycle();
             }
-            fw.write("scan=" + previewScanCount
+
+            File logFile = new File(dir, "scanner_debug.txt");
+            FileWriter fw = new FileWriter(logFile, true);
+            fw.write("scan=" + scanCount
                     + "|dims=" + dims
                     + "|zoom=" + cameraManager.getCurrentZoom()
                     + "|mlkit=" + cameraManager.getLastMlKitResultCount()
@@ -554,6 +609,9 @@ public class ScannerActivity extends AppCompatActivity implements
 
     /**
      * Computes image quality stats for the center region of a bitmap.
+     * Uses getPixels() bulk read — significantly faster than per-pixel getPixel() calls.
+     * Safe to call on a background thread.
+     *
      * Key metrics:
      * - brightness: average luminance (0=black, 255=white)
      * - range: max-min luminance (low = no contrast)
@@ -561,9 +619,20 @@ public class ScannerActivity extends AppCompatActivity implements
      * - sharpPixels%: percentage of pixel transitions > 20 (high = sharp barcode edges)
      */
     private String computeImageStats(Bitmap bmp) {
-        int cx = bmp.getWidth() / 2;
-        int cy = bmp.getHeight() / 2;
-        int half = 100; // 200x200 center region
+        int imgW = bmp.getWidth();
+        int imgH = bmp.getHeight();
+
+        // --- Center region stats (100x100) using bulk getPixels ---
+        int cx = imgW / 2;
+        int cy = imgH / 2;
+        int half = 50; // 100x100 region (reduced from 200x200 for speed)
+        int startX = Math.max(0, cx - half);
+        int startY = Math.max(0, cy - half);
+        int regionW = Math.min(imgW - startX, half * 2);
+        int regionH = Math.min(imgH - startY, half * 2);
+
+        int[] centerPixels = new int[regionW * regionH];
+        bmp.getPixels(centerPixels, 0, regionW, startX, startY, regionW, regionH);
 
         long sumBright = 0;
         long sumEdge = 0;
@@ -571,14 +640,9 @@ public class ScannerActivity extends AppCompatActivity implements
         int sharpCount = 0;
         int minL = 255, maxL = 0;
 
-        int startY = Math.max(0, cy - half);
-        int endY = Math.min(bmp.getHeight(), cy + half);
-        int startX = Math.max(0, cx - half);
-        int endX = Math.min(bmp.getWidth(), cx + half);
-
-        for (int y = startY; y < endY; y++) {
-            for (int x = startX; x < endX; x++) {
-                int pixel = bmp.getPixel(x, y);
+        for (int y = 0; y < regionH; y++) {
+            for (int x = 0; x < regionW; x++) {
+                int pixel = centerPixels[y * regionW + x];
                 int lum = (((pixel >> 16) & 0xFF) * 77
                         + ((pixel >> 8) & 0xFF) * 150
                         + (pixel & 0xFF) * 29) >> 8;
@@ -586,8 +650,8 @@ public class ScannerActivity extends AppCompatActivity implements
                 if (lum < minL) minL = lum;
                 if (lum > maxL) maxL = lum;
 
-                if (x + 1 < endX) {
-                    int next = bmp.getPixel(x + 1, y);
+                if (x + 1 < regionW) {
+                    int next = centerPixels[y * regionW + x + 1];
                     int nLum = (((next >> 16) & 0xFF) * 77
                             + ((next >> 8) & 0xFF) * 150
                             + (next & 0xFF) * 29) >> 8;
@@ -603,21 +667,20 @@ public class ScannerActivity extends AppCompatActivity implements
         float avgEdge = count > 0 ? (float) sumEdge / count : 0;
         float sharpPct = count > 0 ? (float) sharpCount / count * 100 : 0;
 
-        // Scan ALL rows (every 20th) to find the row with MOST horizontal transitions.
-        // A PDF417 barcode has 50+ transitions per row; a blank area has very few.
-        // This tells us WHERE (at what Y) the barcode is in the image, if anywhere.
+        // --- Scan full-width rows (every 20th) to find the row with most transitions.
+        // Uses bulk getPixels per row for speed.
         int maxTransitions = 0;
         int maxTransY = -1;
         int threshold = 25;
-        int imgW = bmp.getWidth();
-        int imgH = bmp.getHeight();
+        int[] rowPixels = new int[imgW];
 
         for (int scanY = 10; scanY < imgH - 10; scanY += 20) {
+            bmp.getPixels(rowPixels, 0, imgW, 0, scanY, imgW, 1);
             int rowTrans = 0;
             int pLum = -1;
             boolean pLight = false;
             for (int x = 0; x < imgW; x++) {
-                int pixel = bmp.getPixel(x, scanY);
+                int pixel = rowPixels[x];
                 int lum = (((pixel >> 16) & 0xFF) * 77
                         + ((pixel >> 8) & 0xFF) * 150
                         + (pixel & 0xFF) * 29) >> 8;
@@ -721,14 +784,13 @@ public class ScannerActivity extends AppCompatActivity implements
         if (currentState == ScanState.SCANNING_FRONT) {
             frontImage = image;
 
-            // Attempt face detection for portrait extraction on the captured image.
-            // If it fails or finds no face, we still transition to flip instruction.
-            if (extractPortrait && image != null) {
-                faceDetector.detectFace(image);
-            } else {
-                // No portrait extraction requested or null image — go straight to flip
-                mainHandler.post(() -> transitionToState(ScanState.FLIP_INSTRUCTION));
-            }
+            // Portrait is already extracted in startFaceScanLoop() at the moment face was detected.
+            // No second detection pass needed — just advance to the flip instruction.
+            mainHandler.post(() -> {
+                if (currentState == ScanState.SCANNING_FRONT) {
+                    transitionToState(ScanState.FLIP_INSTRUCTION);
+                }
+            });
 
         } else if (currentState == ScanState.SCANNING_BACK) {
             backImage = image;
@@ -773,48 +835,13 @@ public class ScannerActivity extends AppCompatActivity implements
     }
 
     /**
-     * Called with each delivered video frame during face detection mode.
-     * Checks every 5th frame for face presence and auto-captures when found.
-     * Matches iOS ScannerViewController.cameraManager:didReceiveSampleBuffer:
+     * Not used: front scan now uses startFaceScanLoop() with previewView.getBitmap()
+     * instead of ImageAnalysis frames (which were 720x720 square — too small for
+     * reliable face detection on printed license photos).
      */
     @Override
     public void onVideoFrameAvailable(Bitmap frame) {
-        if (currentState != ScanState.SCANNING_FRONT || frontCaptureTriggered) {
-            if (frame != null && !frame.isRecycled()) {
-                frame.recycle();
-            }
-            return;
-        }
-
-        // Throttle face checks: every 5th delivered frame (matches iOS kFaceCheckInterval = 5)
-        faceCheckCounter++;
-        if (faceCheckCounter % FACE_CHECK_INTERVAL != 0) {
-            if (frame != null && !frame.isRecycled()) {
-                frame.recycle();
-            }
-            return;
-        }
-
-        // Run face detection on the video frame
-        faceDetector.checkForFacePresence(frame, faceFound -> {
-            // Recycle the frame now that detection is complete
-            if (frame != null && !frame.isRecycled()) {
-                frame.recycle();
-            }
-
-            if (faceFound && currentState == ScanState.SCANNING_FRONT && !frontCaptureTriggered) {
-                Log.d(TAG, "Face detected in video frame — auto-capturing");
-
-                frontCaptureTriggered = true;
-
-                mainHandler.post(() -> {
-                    if (currentState == ScanState.SCANNING_FRONT) {
-                        statusText.setText("Face detected! Capturing...");
-                        cameraManager.captureImage();
-                    }
-                });
-            }
-        });
+        if (frame != null && !frame.isRecycled()) frame.recycle();
     }
 
     // ==================== FaceDetectorHelper.FaceDetectionCallback Implementation ====================
@@ -833,7 +860,19 @@ public class ScannerActivity extends AppCompatActivity implements
 
     @Override
     public void onNoFaceDetected() {
-        Log.w(TAG, "No face in captured photo, will use deterministic crop");
+        Log.w(TAG, "No face detected — applying deterministic crop fallback");
+
+        // Apply deterministic crop on the preview bitmap (same source used for face detection).
+        // This ensures portrait is always set even when ML Kit finds no face.
+        if (extractPortrait) {
+            Bitmap sourceForCrop = previewView.getBitmap();
+            if (sourceForCrop == null) sourceForCrop = frontImage;
+            if (sourceForCrop != null) {
+                portraitImage = FaceDetectorHelper.deterministicCrop(sourceForCrop);
+                Log.w(TAG, "Deterministic crop result: " + (portraitImage != null
+                        ? portraitImage.getWidth() + "x" + portraitImage.getHeight() : "null"));
+            }
+        }
 
         runOnUiThread(() -> {
             if (currentState == ScanState.SCANNING_FRONT) {
@@ -865,16 +904,16 @@ public class ScannerActivity extends AppCompatActivity implements
     }
 
     /**
-     * Cancels any pending timeout, face fallback timer, and preview barcode scan.
+     * Cancels any pending timeout and scan runnables.
      */
     private void cancelTimeout() {
         if (timeoutRunnable != null) {
             mainHandler.removeCallbacks(timeoutRunnable);
             timeoutRunnable = null;
         }
-        if (faceFallbackRunnable != null) {
-            mainHandler.removeCallbacks(faceFallbackRunnable);
-            faceFallbackRunnable = null;
+        if (faceScanRunnable != null) {
+            mainHandler.removeCallbacks(faceScanRunnable);
+            faceScanRunnable = null;
         }
         if (barcodeScanRunnable != null) {
             mainHandler.removeCallbacks(barcodeScanRunnable);
@@ -1019,7 +1058,8 @@ public class ScannerActivity extends AppCompatActivity implements
     protected void onResume() {
         super.onResume();
         if (currentState == ScanState.SCANNING_FRONT) {
-            cameraManager.startCamera(false, true); // re-enable live face detection on resume
+            // Front scan: preview + capture only (face detection via previewView.getBitmap())
+            cameraManager.startCamera(false, false);
         } else if (currentState == ScanState.SCANNING_BACK) {
             cameraManager.startCamera(true);
         }
