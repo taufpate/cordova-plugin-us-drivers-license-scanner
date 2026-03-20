@@ -134,6 +134,10 @@ public class CameraManager {
     private int framesSinceLastDetection = 0;
     private boolean autoTorchActive = false;
 
+    // Night window for auto-torch (configurable from JS options)
+    private int torchNightStart = 20; // 8 pm default
+    private int torchNightEnd   = 4;  // 4 am default
+
     // Track if barcode already found (prevent duplicate reports)
     private volatile boolean barcodeFound = false;
 
@@ -561,11 +565,31 @@ public class CameraManager {
         }
     }
 
+    /**
+     * Returns true if the current local time is within the configured night window.
+     * Auto-torch is only allowed during this window; at other times the user controls torch manually.
+     */
+    private boolean isNightTime() {
+        int hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY);
+        if (torchNightStart <= torchNightEnd) {
+            return hour >= torchNightStart && hour < torchNightEnd;
+        } else {
+            // Spans midnight: e.g. start=20, end=4 → active 20-23 and 0-3
+            return hour >= torchNightStart || hour < torchNightEnd;
+        }
+    }
+
     private void enableAutoTorch() {
         if (camera != null && camera.getCameraInfo().hasFlashUnit()) {
             camera.getCameraControl().enableTorch(true);
             Log.w(TAG, "Auto-torch enabled");
         }
+    }
+
+    /** Sets the local-hour window during which auto-torch may activate automatically. */
+    public void setTorchNightWindow(int start, int end) {
+        torchNightStart = start;
+        torchNightEnd   = end;
     }
 
     /**
@@ -718,8 +742,10 @@ public class CameraManager {
         framesSinceLastDetection++;
         final int scanNum = framesSinceLastDetection;
 
-        // Auto-torch check (UI thread, lightweight)
-        if (!autoTorchActive && framesSinceLastDetection >= AUTO_TORCH_FRAME_THRESHOLD) {
+        // Auto-torch check (UI thread, lightweight).
+        // Only activates automatically during night hours (20:00–04:00); otherwise torch is manual.
+        if (!autoTorchActive && framesSinceLastDetection >= AUTO_TORCH_FRAME_THRESHOLD
+                && isNightTime()) {
             autoTorchActive = true;
             enableAutoTorch();
         }

@@ -61,6 +61,10 @@ declare namespace DriversLicenseScanner {
         enableVibration?: boolean;
         /** Whether to play sound on successful scan (default: true) */
         enableSound?: boolean;
+        /** Hour (0–23) when auto-torch becomes active. Default 20 (8 pm). */
+        torchAutoNightStart?: number;
+        /** Hour (0–23) when auto-torch deactivates. Default 4 (4 am). */
+        torchAutoNightEnd?: number;
     }
 
     /**

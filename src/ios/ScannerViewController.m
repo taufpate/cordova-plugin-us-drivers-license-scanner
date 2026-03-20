@@ -44,16 +44,16 @@
 // Face detection state (front scan)
 @property (nonatomic, assign) BOOL frontFaceDetected;
 @property (nonatomic, assign) BOOL frontCaptureTriggered;
-// Guard: prevents launching a new still capture while one is in flight
-@property (nonatomic, assign) BOOL faceCapturePending;
-// Incremented on every new front scan — orphaned retry blocks check this and bail out
-@property (nonatomic, assign) NSInteger frontScanGeneration;
+// Counter for throttling video-frame face checks
+@property (nonatomic, assign) NSInteger faceFrameCounter;
 
 // Options
 @property (nonatomic, assign) BOOL captureFullImages;
 @property (nonatomic, assign) BOOL extractPortrait;
 @property (nonatomic, assign) NSTimeInterval scanTimeout;
 @property (nonatomic, assign) BOOL enableVibration;
+@property (nonatomic, assign) NSInteger torchAutoNightStart;
+@property (nonatomic, assign) NSInteger torchAutoNightEnd;
 
 // Results
 @property (nonatomic, strong) UIImage *frontImage;
@@ -77,8 +77,7 @@
     self.isDismissing = NO;
     self.frontFaceDetected = NO;
     self.frontCaptureTriggered = NO;
-    self.faceCapturePending = NO;
-    self.frontScanGeneration = 0;
+    self.faceFrameCounter = 0;
 
     [self parseOptions];
     [self setupUI];
@@ -117,6 +116,8 @@
     self.extractPortrait = YES;
     self.scanTimeout = 30.0;
     self.enableVibration = YES;
+    self.torchAutoNightStart = 20;
+    self.torchAutoNightEnd   = 4;
 
     if (self.options) {
         if (self.options[@"captureFullImages"]) {
@@ -130,6 +131,12 @@
         }
         if (self.options[@"enableVibration"]) {
             self.enableVibration = [self.options[@"enableVibration"] boolValue];
+        }
+        if (self.options[@"torchAutoNightStart"]) {
+            self.torchAutoNightStart = [self.options[@"torchAutoNightStart"] integerValue];
+        }
+        if (self.options[@"torchAutoNightEnd"]) {
+            self.torchAutoNightEnd = [self.options[@"torchAutoNightEnd"] integerValue];
         }
     }
 }
@@ -436,6 +443,7 @@
 
     self.cameraManager = [[CameraManager alloc] initWithPreviewContainer:self.previewContainer];
     self.cameraManager.delegate = self;
+    [self.cameraManager setTorchNightWindowStart:self.torchAutoNightStart end:self.torchAutoNightEnd];
 }
 
 #pragma mark - State Management
@@ -535,10 +543,7 @@
 
     self.frontFaceDetected = NO;
     self.frontCaptureTriggered = NO;
-    self.faceCapturePending = NO;
-    // Incrementing generation invalidates all dispatch_after blocks from any previous scan.
-    self.frontScanGeneration++;
-    NSInteger myGeneration = self.frontScanGeneration;
+    self.faceFrameCounter = 0;
 
     // No barcode scanning needed during front scan.
     [self.cameraManager startCameraWithBarcodeScanning:NO];
@@ -551,31 +556,6 @@
             [strongSelf failWithError:@"SCAN_TIMEOUT" message:@"Front scan timed out. Please try again."];
         }
     }];
-
-    // After 1s warmup (autofocus/exposure settle), start periodic still captures.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        __strong __typeof(weakSelf) strongSelf = weakSelf;
-        if (strongSelf && strongSelf.frontScanGeneration == myGeneration) {
-            [strongSelf tryFrontFaceCapture];
-        }
-    });
-}
-
-// Captures a still image for face detection. Called on main thread.
-// If no face is found, schedules itself again after 1.5s.
-- (void)tryFrontFaceCapture {
-    if (self.isDismissing
-            || self.currentState != ScanStateScanningFront
-            || self.frontCaptureTriggered
-            || self.faceCapturePending) {
-        return;
-    }
-
-    NSLog(@"[ScannerVC] Capturing still for face detection");
-    self.faceCapturePending = YES;
-    self.statusLabel.text = @"Looking for face...";
-    [self.cameraManager captureImage];
 }
 
 - (void)showFlipInstruction {
@@ -767,9 +747,17 @@
 }
 
 - (void)cameraManager:(CameraManager *)manager didReceiveSampleBuffer:(CMSampleBufferRef)sampleBuffer {
-    // Called on the video queue — must be thread-safe
-    // Front scan: face detection uses periodic stills, not video frames.
-    if (self.currentState == ScanStateScanningBack) {
+    // Called on the video queue — must be thread-safe.
+    if (self.currentState == ScanStateScanningFront && !self.frontCaptureTriggered) {
+        // Throttle: check every 15 frames (~0.5s at 30fps) to avoid hammering Vision.
+        self.faceFrameCounter++;
+        if (self.faceFrameCounter % 15 == 0) {
+            CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+            if (pixelBuffer) {
+                [self.faceDetector checkFacePresenceInPixelBuffer:pixelBuffer];
+            }
+        }
+    } else if (self.currentState == ScanStateScanningBack) {
         [self.barcodeDecoder decodeSampleBuffer:sampleBuffer];
     }
 }
@@ -899,36 +887,35 @@
     });
 }
 
-- (void)faceDetectorHelperDidNotDetectFace:(FaceDetectorHelper *)helper {
-    NSLog(@"[ScannerVC] No face in still — retrying in 1.5s");
+- (void)faceDetectorHelperDidDetectFacePresence:(FaceDetectorHelper *)helper {
+    // Called on main thread (dispatched by FaceDetectorHelper).
+    if (self.isDismissing || self.currentState != ScanStateScanningFront || self.frontCaptureTriggered) {
+        return;
+    }
+    NSLog(@"[ScannerVC] Face presence detected in video frame — triggering capture");
+    self.frontCaptureTriggered = YES;
+    self.statusLabel.text = @"Face detected! Capturing...";
+    self.scanFrame.layer.borderColor = [UIColor colorWithRed:0 green:0.78 blue:0.33 alpha:1.0].CGColor;
+    // Single capture — shutter plays once, which is expected behavior.
+    [self.cameraManager captureImage];
+}
 
+- (void)faceDetectorHelperDidNotDetectFace:(FaceDetectorHelper *)helper {
+    // Called when detectFaceInImage: (high-res still) finds no face.
+    // Use deterministic portrait crop as fallback and proceed to flip instruction.
+    NSLog(@"[ScannerVC] No face in captured still — using deterministic crop fallback");
     dispatch_async(dispatch_get_main_queue(), ^{
         if (self.isDismissing || self.currentState != ScanStateScanningFront) return;
-        self.faceCapturePending = NO;
-        self.statusLabel.text = @"Hold license steady...";
-
-        // Capture current generation so this retry block won't fire in a future scan.
-        NSInteger myGeneration = self.frontScanGeneration;
-        __weak __typeof(self) weakSelf = self;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            __strong __typeof(weakSelf) strongSelf = weakSelf;
-            if (strongSelf && strongSelf.frontScanGeneration == myGeneration) {
-                [strongSelf tryFrontFaceCapture];
-            }
-        });
+        if (self.extractPortrait && self.frontImage) {
+            self.portraitImage = [ImageUtils extractPortraitDeterministic:self.frontImage];
+        }
+        [self transitionToState:ScanStateFlipInstruction];
     });
 }
 
 - (void)faceDetectorHelper:(FaceDetectorHelper *)helper didFailWithError:(NSError *)error {
-    NSLog(@"[ScannerVC] Face detection error (will retry): %@", error);
+    NSLog(@"[ScannerVC] Face detection error on still: %@", error);
     [self faceDetectorHelperDidNotDetectFace:helper];
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (!self.isDismissing && self.currentState == ScanStateScanningFront) {
-            [self transitionToState:ScanStateFlipInstruction];
-        }
-    });
 }
 
 @end

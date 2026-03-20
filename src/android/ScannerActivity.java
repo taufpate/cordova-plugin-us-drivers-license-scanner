@@ -24,6 +24,7 @@ import android.graphics.Color;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.media.MediaActionSound;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.util.Log;
@@ -93,6 +94,7 @@ public class ScannerActivity extends AppCompatActivity implements
     private AAMVAParser aamvaParser;
     private ExecutorService executorService;
     private Handler mainHandler;
+    private MediaActionSound mediaActionSound;
 
     // Options from plugin
     private boolean captureFullImages = true;
@@ -101,6 +103,8 @@ public class ScannerActivity extends AppCompatActivity implements
     private boolean enableFlash = false;
     private boolean enableVibration = true;
     private boolean enableSound = true;
+    private int torchNightStart = 20;
+    private int torchNightEnd   = 4;
 
     // Current state
     private ScanState currentState = ScanState.SCANNING_FRONT;
@@ -191,6 +195,8 @@ public class ScannerActivity extends AppCompatActivity implements
                 enableFlash = options.optBoolean("enableFlash", false);
                 enableVibration = options.optBoolean("enableVibration", true);
                 enableSound = options.optBoolean("enableSound", true);
+                torchNightStart = options.optInt("torchAutoNightStart", 20);
+                torchNightEnd   = options.optInt("torchAutoNightEnd", 4);
             } catch (JSONException e) {
                 Log.e(TAG, "Error parsing options", e);
             }
@@ -208,6 +214,10 @@ public class ScannerActivity extends AppCompatActivity implements
         faceDetector = new FaceDetectorHelper(this, this);
 
         cameraManager = new CameraManager(this, previewView, this);
+        cameraManager.setTorchNightWindow(torchNightStart, torchNightEnd);
+
+        mediaActionSound = new MediaActionSound();
+        mediaActionSound.load(MediaActionSound.SHUTTER_CLICK);
     }
 
     /**
@@ -361,32 +371,42 @@ public class ScannerActivity extends AppCompatActivity implements
 
                         if (faceFound && currentState == ScanState.SCANNING_FRONT
                                 && !frontCaptureTriggered) {
-                            Log.w(TAG, "Face detected in preview bitmap — triggering capture");
+                            Log.w(TAG, "Face detected in preview bitmap — stabilizing before capture");
                             frontCaptureTriggered = true;
 
-                            // Save portrait now from the live detection crop.
-                            // The live detector already found the correct bounding box — no need
-                            // for a second detection pass on the captured image later.
-                            if (extractPortrait && croppedFace != null) {
-                                portraitImage = croppedFace;
-                                Log.w(TAG, "Portrait saved from live detection: "
-                                        + croppedFace.getWidth() + "x" + croppedFace.getHeight());
-                            } else if (extractPortrait) {
-                                // Live detection found a face but crop failed — use deterministic crop
-                                // on the current frame as immediate fallback.
-                                portraitImage = FaceDetectorHelper.deterministicCrop(frame);
-                                Log.w(TAG, "Portrait fallback from deterministic crop on frame");
-                            }
+                            // Keep initial crop as emergency fallback only.
+                            // The real portrait is grabbed 600ms later on a stabilized frame,
+                            // giving the camera AE/AF time to settle for a sharper result.
+                            final Bitmap emergencyFallback = croppedFace;
 
-                            // Recycle frame only after we're done using it
                             if (!frame.isRecycled()) frame.recycle();
 
-                            mainHandler.post(() -> {
-                                if (currentState == ScanState.SCANNING_FRONT) {
-                                    statusText.setText("Face detected! Capturing...");
-                                    cameraManager.captureImage();
+                            // Delay capture: let camera stabilize (AE/AF settle) before taking portrait.
+                            mainHandler.postDelayed(() -> {
+                                if (currentState != ScanState.SCANNING_FRONT) return;
+                                statusText.setText("Hold still...");
+
+                                Bitmap stableFrame = previewView.getBitmap();
+                                if (stableFrame != null && extractPortrait) {
+                                    // Detect face again on the now-stable frame for a sharp portrait crop.
+                                    faceDetector.checkForFacePresence(stableFrame, (found2, stableCrop) -> {
+                                        if (found2 && stableCrop != null) {
+                                            portraitImage = stableCrop;
+                                            Log.w(TAG, "Stable portrait captured: "
+                                                    + stableCrop.getWidth() + "x" + stableCrop.getHeight());
+                                        } else if (emergencyFallback != null) {
+                                            portraitImage = emergencyFallback;
+                                            Log.w(TAG, "Using emergency fallback portrait");
+                                        }
+                                        if (!stableFrame.isRecycled()) stableFrame.recycle();
+                                        mainHandler.post(() -> triggerFrontCapture());
+                                    });
+                                } else {
+                                    if (stableFrame != null && !stableFrame.isRecycled()) stableFrame.recycle();
+                                    if (emergencyFallback != null) portraitImage = emergencyFallback;
+                                    triggerFrontCapture();
                                 }
-                            });
+                            }, 600);
                         } else {
                             if (!frame.isRecycled()) frame.recycle();
                         }
@@ -399,6 +419,18 @@ public class ScannerActivity extends AppCompatActivity implements
             }
         };
         mainHandler.post(faceScanRunnable);
+    }
+
+    /**
+     * Plays the shutter sound (if enabled) and triggers the front capture.
+     * Must be called on the main thread.
+     */
+    private void triggerFrontCapture() {
+        if (currentState != ScanState.SCANNING_FRONT) return;
+        if (enableSound && mediaActionSound != null) {
+            mediaActionSound.play(MediaActionSound.SHUTTER_CLICK);
+        }
+        cameraManager.captureImage();
     }
 
     /**
@@ -784,8 +816,8 @@ public class ScannerActivity extends AppCompatActivity implements
         if (currentState == ScanState.SCANNING_FRONT) {
             frontImage = image;
 
-            // Portrait is already extracted in startFaceScanLoop() at the moment face was detected.
-            // No second detection pass needed — just advance to the flip instruction.
+            // Portrait was already extracted from the stabilized preview frame in triggerFrontCapture().
+            // Just advance to flip instruction.
             mainHandler.post(() -> {
                 if (currentState == ScanState.SCANNING_FRONT) {
                     transitionToState(ScanState.FLIP_INSTRUCTION);
@@ -805,8 +837,6 @@ public class ScannerActivity extends AppCompatActivity implements
             backRawData = rawData;
 
             runOnUiThread(() -> {
-                Toast.makeText(this, "Barcode found! " + rawData.length() + " chars", Toast.LENGTH_SHORT).show();
-
                 // Grab back image from preview (more reliable than CameraX capture on some devices)
                 Bitmap backPreview = previewView.getBitmap();
                 if (backPreview != null) {
@@ -862,16 +892,12 @@ public class ScannerActivity extends AppCompatActivity implements
     public void onNoFaceDetected() {
         Log.w(TAG, "No face detected — applying deterministic crop fallback");
 
-        // Apply deterministic crop on the preview bitmap (same source used for face detection).
-        // This ensures portrait is always set even when ML Kit finds no face.
-        if (extractPortrait) {
-            Bitmap sourceForCrop = previewView.getBitmap();
-            if (sourceForCrop == null) sourceForCrop = frontImage;
-            if (sourceForCrop != null) {
-                portraitImage = FaceDetectorHelper.deterministicCrop(sourceForCrop);
-                Log.w(TAG, "Deterministic crop result: " + (portraitImage != null
-                        ? portraitImage.getWidth() + "x" + portraitImage.getHeight() : "null"));
-            }
+        // portraitImage may already be set from the live detection preview crop.
+        // Only apply deterministic crop as last resort if portrait is still null.
+        if (extractPortrait && portraitImage == null && frontImage != null) {
+            portraitImage = ImageUtils.extractPortraitDeterministic(frontImage);
+            Log.w(TAG, "Deterministic crop last-resort result: " + (portraitImage != null
+                    ? portraitImage.getWidth() + "x" + portraitImage.getHeight() : "null"));
         }
 
         runOnUiThread(() -> {
@@ -1086,6 +1112,10 @@ public class ScannerActivity extends AppCompatActivity implements
 
         if (executorService != null) {
             executorService.shutdown();
+        }
+
+        if (mediaActionSound != null) {
+            mediaActionSound.release();
         }
 
         // Recycle bitmaps

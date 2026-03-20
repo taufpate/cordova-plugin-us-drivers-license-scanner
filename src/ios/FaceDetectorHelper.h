@@ -41,6 +41,12 @@ NS_ASSUME_NONNULL_BEGIN
  */
 - (void)faceDetectorHelper:(FaceDetectorHelper *)helper didFailWithError:(NSError *)error;
 
+/**
+ * Called when a face is detected in a live video frame (presence only, no crop yet).
+ * The caller should now trigger a high-resolution capture for portrait extraction.
+ */
+- (void)faceDetectorHelperDidDetectFacePresence:(FaceDetectorHelper *)helper;
+
 @end
 
 /**
@@ -57,6 +63,16 @@ NS_ASSUME_NONNULL_BEGIN
  * @param image The image to analyze
  */
 - (void)detectFaceInImage:(UIImage *)image;
+
+/**
+ * Checks for face presence in a CVPixelBuffer from a live video frame.
+ * Does NOT crop — only reports presence via faceDetectorHelperDidDetectFacePresence:.
+ * If no face is found, the method returns silently (no delegate call).
+ * Thread-safe: safe to call from the video capture queue.
+ *
+ * @param pixelBuffer The pixel buffer from AVCaptureVideoDataOutput
+ */
+- (void)checkFacePresenceInPixelBuffer:(CVPixelBufferRef)pixelBuffer;
 
 @end
 

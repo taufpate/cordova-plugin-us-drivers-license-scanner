@@ -20,6 +20,8 @@
 
     <!-- Android Platform -->
     <platform name="android">
+        <!-- CameraX requires API 21+; we target 24+ to match Cordova Android 14 minimum -->
+        <preference name="android-minSdkVersion" value="24" />
         <config-file target="res/xml/config.xml" parent="/*">
             <feature name="DriversLicenseScanner">
                 <param name="android-package" value="com.sos.driverslicensescanner.DriversLicenseScannerPlugin" />

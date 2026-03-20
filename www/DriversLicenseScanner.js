@@ -65,6 +65,8 @@ var DriversLicenseScanner = {
      * @param {boolean} [options.enableFlash=false] - Whether to enable flash/torch
      * @param {boolean} [options.enableVibration=true] - Whether to vibrate on successful scan
      * @param {boolean} [options.enableSound=true] - Whether to play sound on successful scan
+     * @param {number} [options.torchAutoNightStart=20] - Hour (0-23) when auto-torch becomes active (default 20 = 8pm)
+     * @param {number} [options.torchAutoNightEnd=4]   - Hour (0-23) when auto-torch deactivates (default 4 = 4am)
      *
      * @returns {Promise<ScanResult>} Promise resolving to scan result
      *
@@ -86,7 +88,9 @@ var DriversLicenseScanner = {
                 scanTimeoutMs: 30000,
                 enableFlash: false,
                 enableVibration: true,
-                enableSound: true
+                enableSound: true,
+                torchAutoNightStart: 20,
+                torchAutoNightEnd: 4
             };
 
             var mergedOptions = Object.assign({}, defaultOptions, options || {});

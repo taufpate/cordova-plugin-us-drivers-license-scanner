@@ -22,6 +22,7 @@ static CGFloat const kMaxFaceSizeRatio = 0.70;
 @interface FaceDetectorHelper ()
 
 @property (nonatomic, strong) dispatch_queue_t detectionQueue;
+@property (atomic, assign) BOOL isBusy;
 
 @end
 
@@ -49,6 +50,62 @@ static CGFloat const kMaxFaceSizeRatio = 0.70;
     dispatch_async(self.detectionQueue, ^{
         [self performFaceDetection:image];
     });
+}
+
+- (void)checkFacePresenceInPixelBuffer:(CVPixelBufferRef)pixelBuffer {
+    if (self.isBusy || !pixelBuffer) return;
+    self.isBusy = YES;
+
+    // Retain buffer for async use on the detection queue
+    CVPixelBufferRetain(pixelBuffer);
+    dispatch_async(self.detectionQueue, ^{
+        [self performPresenceDetectionInPixelBuffer:pixelBuffer];
+        CVPixelBufferRelease(pixelBuffer);
+    });
+}
+
+/**
+ * Runs VNDetectFaceRectanglesRequest on a pixel buffer.
+ * Reports presence via delegate if a face passes size filters.
+ * Orientation: kCGImagePropertyOrientationRight = phone held in portrait (camera buffer is landscape-right).
+ */
+- (void)performPresenceDetectionInPixelBuffer:(CVPixelBufferRef)pixelBuffer {
+    __weak __typeof(self) weakSelf = self;
+
+    VNDetectFaceRectanglesRequest *request = [[VNDetectFaceRectanglesRequest alloc]
+        initWithCompletionHandler:^(VNRequest *req, NSError *error) {
+            __strong __typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            strongSelf.isBusy = NO;
+
+            if (error || !req.results || req.results.count == 0) return;
+
+            // Check that at least one face passes the area-size filter
+            for (VNFaceObservation *face in req.results) {
+                CGFloat area = face.boundingBox.size.width * face.boundingBox.size.height;
+                if (area >= kMinFaceSizeRatio && area <= kMaxFaceSizeRatio) {
+                    id<FaceDetectorHelperDelegate> delegate = strongSelf.delegate;
+                    if (delegate && [delegate respondsToSelector:@selector(faceDetectorHelperDidDetectFacePresence:)]) {
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            [delegate faceDetectorHelperDidDetectFacePresence:strongSelf];
+                        });
+                    }
+                    return;
+                }
+            }
+        }];
+
+    // Phone held in portrait → video buffer is landscape-right (top of physical scene is on the right of the buffer)
+    VNImageRequestHandler *handler = [[VNImageRequestHandler alloc]
+        initWithCVPixelBuffer:pixelBuffer
+                  orientation:kCGImagePropertyOrientationRight
+                      options:@{}];
+
+    NSError *handlerError = nil;
+    if (![handler performRequests:@[request] error:&handlerError]) {
+        self.isBusy = NO;
+        NSLog(@"[FaceDetector] Pixel buffer detection error: %@", handlerError);
+    }
 }
 
 #pragma mark - Orientation Normalization

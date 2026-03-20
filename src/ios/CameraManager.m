@@ -38,6 +38,8 @@
 // Low light causes the camera to use longer exposure → motion blur → harder to read.
 @property (nonatomic, assign) NSInteger framesSinceLastDetection;
 @property (nonatomic, assign) BOOL autoTorchActive;
+@property (nonatomic, assign) NSInteger torchNightStart; // default 20
+@property (nonatomic, assign) NSInteger torchNightEnd;   // default 4
 
 @end
 
@@ -67,6 +69,8 @@ static NSInteger const kAutoTorchFrameThreshold = 45;
         _frameCounter = 0;
         _framesSinceLastDetection = 0;
         _autoTorchActive = NO;
+        _torchNightStart = 20;
+        _torchNightEnd   = 4;
 
         [self setupSession];
     }
@@ -444,8 +448,10 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     // Auto-torch: if barcode hasn't been detected after many frames, the
     // issue is likely low light causing motion blur. Enable torch at moderate
     // intensity to improve both native and ZXingObjC detection.
+    // Only fires automatically during night hours (20:00–04:00); otherwise torch is manual.
     self.framesSinceLastDetection++;
-    if (!self.autoTorchActive && self.framesSinceLastDetection >= kAutoTorchFrameThreshold) {
+    if (!self.autoTorchActive && self.framesSinceLastDetection >= kAutoTorchFrameThreshold
+            && [self isNightTime]) {
         self.autoTorchActive = YES;
         [self enableAutoTorch];
     }
@@ -455,6 +461,27 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 }
 
 #pragma mark - Auto-Torch
+
+/**
+ * Returns YES if the current local time is within the configured night window.
+ * Auto-torch only fires automatically during this window; outside of it the user controls torch.
+ */
+- (BOOL)isNightTime {
+    NSCalendar *cal = [NSCalendar currentCalendar];
+    NSDateComponents *comps = [cal components:NSCalendarUnitHour fromDate:[NSDate date]];
+    NSInteger hour = comps.hour;
+    if (self.torchNightStart <= self.torchNightEnd) {
+        return (hour >= self.torchNightStart && hour < self.torchNightEnd);
+    } else {
+        // Spans midnight: e.g. start=20, end=4
+        return (hour >= self.torchNightStart || hour < self.torchNightEnd);
+    }
+}
+
+- (void)setTorchNightWindowStart:(NSInteger)start end:(NSInteger)end {
+    self.torchNightStart = start;
+    self.torchNightEnd   = end;
+}
 
 /**
  * Enables torch at moderate intensity (~50%) when barcode scanning is

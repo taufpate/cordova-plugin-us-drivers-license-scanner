@@ -108,6 +108,12 @@ NS_ASSUME_NONNULL_BEGIN
  */
 - (void)setFocusPoint:(CGPoint)point;
 
+/**
+ * Sets the local-hour window (0–23) during which auto-torch may activate automatically.
+ * Default: start=20 (8 pm), end=4 (4 am).
+ */
+- (void)setTorchNightWindowStart:(NSInteger)start end:(NSInteger)end;
+
 @end
 
 NS_ASSUME_NONNULL_END

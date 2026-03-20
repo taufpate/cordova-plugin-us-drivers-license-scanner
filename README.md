@@ -2,6 +2,12 @@
 
 A Cordova/Ionic plugin for scanning US Driver Licenses using PDF417 barcodes with a guided two-step scan flow. Fully offline, no paid SDKs, no API keys required.
 
+## Credits
+
+This plugin was developed by using Claude AI, an advanced language model by Anthropic, for code generation and documentation. The plugin is built on top of free and open-source libraries including ZXing for barcode decoding and ML Kit/Vision for face detection.
+
+I'm grateful to the open-source community for providing the tools and libraries that made this project possible, and to Anthropic for creating Claude, which significantly accelerated development and to save your tokens for more important things.
+
 ## Features
 
 - **Guided Scan Flow**: Front scan → Flip instruction → Back scan
@@ -14,10 +20,10 @@ A Cordova/Ionic plugin for scanning US Driver Licenses using PDF417 barcodes wit
 
 ## Platform Compatibility
 
-| Platform | Version | Notes |
-|----------|---------|-------|
-| Android | cordova-android 14.0.1+ | minSdk 24, CameraX + ZXing |
-| iOS | cordova-ios 7.1.1+ | iOS 13.0+, AVFoundation + ZXingObjC |
+| Platform | Version                 | Notes                               |
+| -------- | ----------------------- | ----------------------------------- |
+| Android  | cordova-android 14.0.1+ | minSdk 24, CameraX + ZXing          |
+| iOS      | cordova-ios 7.1.1+      | iOS 13.0+, AVFoundation + ZXingObjC |
 
 ## Installation
 
@@ -71,6 +77,8 @@ interface ScanOptions {
   enableFlash?: boolean;          // Default: false
   enableVibration?: boolean;      // Default: true
   enableSound?: boolean;          // Default: true
+  torchAutoNightStart?: number;   // Default: 20 (8 pm)
+  torchAutoNightEnd?: number;     // Default: 4  (4 am)
 }
 
 interface ScanResult {
@@ -82,6 +90,21 @@ interface ScanResult {
   fullBackImageBase64?: string;
 }
 ```
+
+**Options:**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `captureFullImages` | `boolean` | `true` | Whether to capture full front/back images |
+| `extractPortrait` | `boolean` | `true` | Whether to extract the portrait image |
+| `scanTimeoutMs` | `number` | `30000` | Timeout per scan step in milliseconds |
+| `enableFlash` | `boolean` | `false` | Whether to enable flash/torch |
+| `enableVibration` | `boolean` | `true` | Whether to vibrate on successful scan |
+| `enableSound` | `boolean` | `true` | Whether to play sound on successful scan |
+| `torchAutoNightStart` | `number` | `20` | Hour (0–23) when auto-torch becomes active automatically (default 8 pm) |
+| `torchAutoNightEnd` | `number` | `4` | Hour (0–23) when auto-torch deactivates (default 4 am) |
+
+> **Auto-torch:** The torch activates automatically during back scanning if the barcode isn't detected within ~3 seconds AND the current local time is within the configured night window (`torchAutoNightStart` to `torchAutoNightEnd`). Outside the night window, torch is manual only (via the flash button).
 
 **Example:**
 
@@ -145,47 +168,47 @@ cordova.plugins.DriversLicenseScanner.parseAAMVAData(rawBarcodeString)
 
 The `parsedFields` object contains the following fields:
 
-| Field | AAMVA Code | Description |
-|-------|------------|-------------|
-| firstName | DAC | First name |
-| middleName | DAD | Middle name |
-| lastName | DCS | Last name / Family name |
-| fullName | - | Combined full name |
-| dateOfBirth | DBB | Date of birth (ISO format) |
-| dateOfBirthRaw | DBB | Raw date from barcode |
-| streetAddress | DAG | Street address |
-| city | DAI | City |
-| state | DAJ | State code |
-| postalCode | DAK | ZIP code |
-| fullAddress | - | Combined full address |
-| licenseNumber | DAQ | Driver license number |
-| gender | DBC | Gender (Male/Female/Unknown) |
-| genderCode | DBC | Raw gender code |
-| issueDate | DBD | Issue date (ISO format) |
-| expirationDate | DBA | Expiration date (ISO format) |
-| issuingState | - | Issuing state |
-| issuingCountry | DCG | Country code |
-| documentDiscriminator | DCF | Document discriminator |
-| height | DAU | Height |
-| eyeColor | DAY | Eye color |
-| hairColor | DAZ | Hair color |
-| weight | DAW/DAX | Weight |
-| nameSuffix | DCU | Name suffix |
-| aamvaVersion | - | AAMVA version number |
-| isExpired | - | Whether license is expired |
-| isValid | - | Whether parsing was successful |
+| Field                 | AAMVA Code | Description                    |
+| --------------------- | ---------- | ------------------------------ |
+| firstName             | DAC        | First name                     |
+| middleName            | DAD        | Middle name                    |
+| lastName              | DCS        | Last name / Family name        |
+| fullName              | -          | Combined full name             |
+| dateOfBirth           | DBB        | Date of birth (ISO format)     |
+| dateOfBirthRaw        | DBB        | Raw date from barcode          |
+| streetAddress         | DAG        | Street address                 |
+| city                  | DAI        | City                           |
+| state                 | DAJ        | State code                     |
+| postalCode            | DAK        | ZIP code                       |
+| fullAddress           | -          | Combined full address          |
+| licenseNumber         | DAQ        | Driver license number          |
+| gender                | DBC        | Gender (Male/Female/Unknown)   |
+| genderCode            | DBC        | Raw gender code                |
+| issueDate             | DBD        | Issue date (ISO format)        |
+| expirationDate        | DBA        | Expiration date (ISO format)   |
+| issuingState          | -          | Issuing state                  |
+| issuingCountry        | DCG        | Country code                   |
+| documentDiscriminator | DCF        | Document discriminator         |
+| height                | DAU        | Height                         |
+| eyeColor              | DAY        | Eye color                      |
+| hairColor             | DAZ        | Hair color                     |
+| weight                | DAW/DAX    | Weight                         |
+| nameSuffix            | DCU        | Name suffix                    |
+| aamvaVersion          | -          | AAMVA version number           |
+| isExpired             | -          | Whether license is expired     |
+| isValid               | -          | Whether parsing was successful |
 
 ## Error Codes
 
-| Code | Description |
-|------|-------------|
-| CAMERA_PERMISSION_DENIED | Camera permission was denied |
-| CAMERA_NOT_AVAILABLE | Camera hardware not available |
-| SCAN_CANCELLED | User cancelled the scan |
-| BARCODE_NOT_FOUND | PDF417 barcode not detected |
-| PARSE_ERROR | Error parsing AAMVA data |
-| FACE_NOT_DETECTED | Face not detected for portrait |
-| UNKNOWN_ERROR | Unknown error occurred |
+| Code                     | Description                    |
+| ------------------------ | ------------------------------ |
+| CAMERA_PERMISSION_DENIED | Camera permission was denied   |
+| CAMERA_NOT_AVAILABLE     | Camera hardware not available  |
+| SCAN_CANCELLED           | User cancelled the scan        |
+| BARCODE_NOT_FOUND        | PDF417 barcode not detected    |
+| PARSE_ERROR              | Error parsing AAMVA data       |
+| FACE_NOT_DETECTED        | Face not detected for portrait |
+| UNKNOWN_ERROR            | Unknown error occurred         |
 
 ## Ionic Angular Integration
 
@@ -340,4 +363,4 @@ MIT License
 
 ## Support
 
-For issues and feature requests, please open an issue on the repository.
+For issues and feature requests, please serve yourself using Claude X-D.
