@@ -435,28 +435,27 @@ didOutputMetadataObjects:(NSArray<__kindof AVMetadataObject *> *)metadataObjects
 didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
        fromConnection:(AVCaptureConnection *)connection {
 
-    if (!self.isBarcodeScanning) {
-        return;
+    if (self.isBarcodeScanning) {
+        // Frame throttling: only process every Nth frame to reduce memory pressure
+        self.frameCounter++;
+        if (self.frameCounter % kFrameSkipInterval != 0) {
+            return;
+        }
+
+        // Auto-torch: if barcode hasn't been detected after many frames, the
+        // issue is likely low light causing motion blur. Enable torch at moderate
+        // intensity to improve both native and ZXingObjC detection.
+        // Only fires automatically during night hours (20:00–04:00); otherwise torch is manual.
+        self.framesSinceLastDetection++;
+        if (!self.autoTorchActive && self.framesSinceLastDetection >= kAutoTorchFrameThreshold
+                && [self isNightTime]) {
+            self.autoTorchActive = YES;
+            [self enableAutoTorch];
+        }
     }
 
-    // Frame throttling: only process every Nth frame to reduce memory pressure
-    self.frameCounter++;
-    if (self.frameCounter % kFrameSkipInterval != 0) {
-        return;
-    }
-
-    // Auto-torch: if barcode hasn't been detected after many frames, the
-    // issue is likely low light causing motion blur. Enable torch at moderate
-    // intensity to improve both native and ZXingObjC detection.
-    // Only fires automatically during night hours (20:00–04:00); otherwise torch is manual.
-    self.framesSinceLastDetection++;
-    if (!self.autoTorchActive && self.framesSinceLastDetection >= kAutoTorchFrameThreshold
-            && [self isNightTime]) {
-        self.autoTorchActive = YES;
-        [self enableAutoTorch];
-    }
-
-    // Deliver to delegate for ZXingObjC processing or face detection
+    // Always deliver to delegate — front scan uses frames for face presence detection,
+    // back scan uses them for ZXingObjC barcode decoding.
     [self.delegate cameraManager:self didReceiveSampleBuffer:sampleBuffer];
 }
 
