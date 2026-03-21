@@ -152,8 +152,9 @@ static CGFloat const kMaxFaceSizeRatio = 0.70;
           NSStringFromCGSize(normalizedImage.size), cgWidth, cgHeight,
           (long)normalizedImage.imageOrientation);
 
-    // Create face detection request
-    VNDetectFaceRectanglesRequest *request = [[VNDetectFaceRectanglesRequest alloc]
+    // Use VNDetectFaceLandmarksRequest (superset of rectangles) so that the
+    // VNFaceObservation.roll property is reliably populated — required for tilt correction.
+    VNDetectFaceLandmarksRequest *request = [[VNDetectFaceLandmarksRequest alloc]
         initWithCompletionHandler:^(VNRequest *request, NSError *error) {
             if (error) {
                 NSLog(@"[FaceDetector] Detection error: %@", error);
@@ -285,57 +286,112 @@ static CGFloat const kMaxFaceSizeRatio = 0.70;
 }
 
 - (UIImage *)extractFaceRegion:(VNFaceObservation *)face fromImage:(UIImage *)image {
-    CGRect normalizedBounds = face.boundingBox;
-
-    // Since the image is normalized (orientation=Up), UIImage.size matches
-    // CGImage pixel dimensions. Both Vision and CGImageCreateWithImageInRect
-    // operate in the same coordinate space.
-    CGFloat imageWidth = image.size.width;
+    CGFloat imageWidth  = image.size.width;
     CGFloat imageHeight = image.size.height;
 
-    // Convert from Vision coordinates (bottom-left origin, normalized)
-    // to UIKit/CGImage coordinates (top-left origin, pixels)
-    CGFloat x = normalizedBounds.origin.x * imageWidth;
-    CGFloat y = (1.0 - normalizedBounds.origin.y - normalizedBounds.size.height) * imageHeight;
-    CGFloat width = normalizedBounds.size.width * imageWidth;
-    CGFloat height = normalizedBounds.size.height * imageHeight;
+    // Convert Vision coords (bottom-left, normalized) → UIKit pixels (top-left)
+    CGRect nb = face.boundingBox;
+    CGFloat faceX = nb.origin.x * imageWidth;
+    CGFloat faceY = (1.0 - nb.origin.y - nb.size.height) * imageHeight;
+    CGFloat faceW = nb.size.width  * imageWidth;
+    CGFloat faceH = nb.size.height * imageHeight;
 
-    NSLog(@"[FaceDetector] Face pixel coords: x=%.0f y=%.0f w=%.0f h=%.0f (image: %.0fx%.0f)",
-          x, y, width, height, imageWidth, imageHeight);
+    // Face centre in image pixels
+    CGFloat cx = faceX + faceW / 2.0;
+    CGFloat cy = faceY + faceH / 2.0;
 
-    // Add padding around face for a natural portrait crop
-    CGFloat paddingX = width * kFacePaddingFactor;
-    CGFloat paddingY = height * kFacePaddingFactor;
+    NSLog(@"[FaceDetector] Face: x=%.0f y=%.0f w=%.0f h=%.0f centre=(%.0f,%.0f)",
+          faceX, faceY, faceW, faceH, cx, cy);
 
-    CGFloat left = MAX(0, x - paddingX);
-    CGFloat top = MAX(0, y - paddingY);
-    CGFloat right = MIN(imageWidth, x + width + paddingX);
-    CGFloat bottom = MIN(imageHeight, y + height + paddingY);
+    // Roll angle (0 if not available)
+    CGFloat roll = (face.roll != nil) ? face.roll.floatValue : 0.0;
+    NSLog(@"[FaceDetector] Roll = %.3f rad (%.1f°)", roll, roll * 180.0 / M_PI);
 
-    CGRect cropRect = CGRectMake(left, top, right - left, bottom - top);
+    // Desired output square side: face size + portrait padding on all sides
+    CGFloat faceSize   = MAX(faceW, faceH);
+    CGFloat outputSize = ceil(faceSize * (1.0 + kFacePaddingFactor * 2.0));
 
-    NSLog(@"[FaceDetector] Crop rect with padding: x=%.0f y=%.0f w=%.0f h=%.0f",
-          cropRect.origin.x, cropRect.origin.y, cropRect.size.width, cropRect.size.height);
+    // Pre-rotation crop must be large enough so rotating it by `roll` leaves
+    // no empty corners inside the central outputSize × outputSize region.
+    // Required side = outputSize × (|cos| + |sin|), i.e. the bounding box of
+    // a rotated square of side outputSize.
+    CGFloat sinA = fabs(sin(roll));
+    CGFloat cosA = fabs(cos(roll));
+    CGFloat preCropSize = ceil(outputSize * (cosA + sinA)) + 4;
 
-    // Validate crop rect
-    if (cropRect.size.width <= 0 || cropRect.size.height <= 0) {
-        NSLog(@"[FaceDetector] Invalid crop rect dimensions");
+    // Crop centred on the face, clamped to image bounds
+    CGFloat left   = MAX(0,           cx - preCropSize / 2.0);
+    CGFloat top    = MAX(0,           cy - preCropSize / 2.0);
+    CGFloat right  = MIN(imageWidth,  cx + preCropSize / 2.0);
+    CGFloat bottom = MIN(imageHeight, cy + preCropSize / 2.0);
+
+    CGRect preCropRect = CGRectMake(left, top, right - left, bottom - top);
+    if (preCropRect.size.width <= 0 || preCropRect.size.height <= 0) {
+        NSLog(@"[FaceDetector] Invalid pre-crop rect");
         return nil;
     }
 
-    // Crop the image
+    CGImageRef cgLarge = CGImageCreateWithImageInRect(image.CGImage, preCropRect);
+    if (!cgLarge) {
+        NSLog(@"[FaceDetector] CGImageCreateWithImageInRect (large) failed");
+        return nil;
+    }
+    UIImage *largeImage = [UIImage imageWithCGImage:cgLarge
+                                              scale:image.scale
+                                        orientation:UIImageOrientationUp];
+    CGImageRelease(cgLarge);
+
+    // Rotate the large image to align the face upright.
+    // UIKit image context has Y-axis flipped: positive angle = clockwise in output.
+    // roll > 0 = face tilted counter-clockwise → clockwise correction = +roll.
+    UIImage *rotated = (fabs(roll) > 0.052)
+        ? [self rotateImage:largeImage byRadians:roll]
+        : largeImage;
+
+    // Crop a square from the centre of the rotated image — the face is centred
+    // there and all corners are filled with real image content (no white gaps).
+    return [self centerSquareCrop:rotated size:outputSize];
+}
+
+/**
+ * Rotates an image by `radians` around its centre.
+ * Canvas expands to contain the full rotated content (no clipping).
+ */
+- (UIImage *)rotateImage:(UIImage *)image byRadians:(CGFloat)radians {
+    CGFloat sinA = fabs(sin(radians));
+    CGFloat cosA = fabs(cos(radians));
+    CGFloat newW = image.size.width  * cosA + image.size.height * sinA;
+    CGFloat newH = image.size.width  * sinA + image.size.height * cosA;
+
+    UIGraphicsBeginImageContextWithOptions(CGSizeMake(newW, newH), NO, image.scale);
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    CGContextTranslateCTM(ctx, newW / 2.0, newH / 2.0);
+    CGContextRotateCTM(ctx, radians);
+    [image drawInRect:CGRectMake(-image.size.width  / 2.0,
+                                 -image.size.height / 2.0,
+                                  image.size.width,
+                                  image.size.height)];
+    UIImage *result = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return result ?: image;
+}
+
+/**
+ * Crops a square of `size` pixels from the centre of `image`.
+ * The centre of the image = the (corrected) face centre.
+ */
+- (UIImage *)centerSquareCrop:(UIImage *)image size:(CGFloat)size {
+    CGFloat side = MIN(size, MIN(image.size.width, image.size.height));
+    CGRect cropRect = CGRectMake((image.size.width  - side) / 2.0,
+                                 (image.size.height - side) / 2.0,
+                                  side, side);
     CGImageRef cgImage = CGImageCreateWithImageInRect(image.CGImage, cropRect);
-    if (!cgImage) {
-        NSLog(@"[FaceDetector] CGImageCreateWithImageInRect failed");
-        return nil;
-    }
-
-    UIImage *croppedImage = [UIImage imageWithCGImage:cgImage
-                                                scale:image.scale
-                                          orientation:UIImageOrientationUp];
+    if (!cgImage) return image;
+    UIImage *result = [UIImage imageWithCGImage:cgImage
+                                          scale:image.scale
+                                    orientation:UIImageOrientationUp];
     CGImageRelease(cgImage);
-
-    return croppedImage;
+    return result;
 }
 
 #pragma mark - Delegate Notifications

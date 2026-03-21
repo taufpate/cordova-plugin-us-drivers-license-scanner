@@ -14,6 +14,7 @@ package com.sos.driverslicensescanner;
 
 import android.content.Context;
 import android.graphics.Bitmap;
+import android.graphics.Matrix;
 import android.graphics.Rect;
 import android.util.Log;
 
@@ -279,28 +280,91 @@ public class FaceDetectorHelper {
     private Bitmap extractFaceRegion(Bitmap bitmap, Face face) {
         Rect bounds = face.getBoundingBox();
 
-        int paddingX = (int) (bounds.width() * FACE_PADDING_FACTOR);
-        int paddingY = (int) (bounds.height() * FACE_PADDING_FACTOR);
+        float faceCX = bounds.exactCenterX();
+        float faceCY = bounds.exactCenterY();
+        float faceW  = bounds.width();
+        float faceH  = bounds.height();
 
-        int left = Math.max(0, bounds.left - paddingX);
-        int top = Math.max(0, bounds.top - paddingY);
-        int right = Math.min(bitmap.getWidth(), bounds.right + paddingX);
-        int bottom = Math.min(bitmap.getHeight(), bounds.bottom + paddingY);
+        float angleZ = face.getHeadEulerAngleZ();
+        Log.d(TAG, "Face eulerAngleZ=" + angleZ + "° centre=(" + faceCX + "," + faceCY + ")");
 
-        int width = right - left;
-        int height = bottom - top;
+        // Desired output square: face size + portrait padding on all sides
+        float faceSize   = Math.max(faceW, faceH);
+        float outputSize = (float) Math.ceil(faceSize * (1.0f + FACE_PADDING_FACTOR * 2.0f));
 
-        if (width <= 0 || height <= 0) {
-            Log.w(TAG, "Invalid crop region calculated");
+        // Pre-rotation crop must be large enough so rotating it by angleZ leaves
+        // no empty corners inside the central outputSize × outputSize region.
+        // Required side = outputSize × (|cos| + |sin|).
+        double rad = Math.toRadians(angleZ);
+        float sinA = (float) Math.abs(Math.sin(rad));
+        float cosA = (float) Math.abs(Math.cos(rad));
+        float preCropSize = (float) Math.ceil(outputSize * (cosA + sinA)) + 4;
+
+        // Crop centred on the face, clamped to bitmap bounds
+        int left   = Math.max(0,                 (int)(faceCX - preCropSize / 2));
+        int top    = Math.max(0,                 (int)(faceCY - preCropSize / 2));
+        int right  = Math.min(bitmap.getWidth(),  (int)(faceCX + preCropSize / 2));
+        int bottom = Math.min(bitmap.getHeight(), (int)(faceCY + preCropSize / 2));
+
+        int w = right - left;
+        int h = bottom - top;
+        if (w <= 0 || h <= 0) {
+            Log.w(TAG, "Invalid pre-crop region");
             return null;
         }
 
         try {
-            return Bitmap.createBitmap(bitmap, left, top, width, height);
+            Bitmap large = Bitmap.createBitmap(bitmap, left, top, w, h);
+
+            // Rotate the large region to align the face upright.
+            // Matrix.setRotate positive = clockwise.
+            // angleZ > 0 = face tilted counter-clockwise → clockwise correction = +angleZ.
+            Bitmap rotated = (Math.abs(angleZ) >= 3.0f)
+                    ? rotateBitmap(large, angleZ)
+                    : large;
+
+            // Crop a square from the centre — face is centred, no white corners.
+            return centerSquareCrop(rotated, (int) outputSize);
+
         } catch (Exception e) {
-            Log.e(TAG, "Error cropping bitmap", e);
+            Log.e(TAG, "Error extracting face region", e);
             return null;
         }
+    }
+
+    /**
+     * Rotates a bitmap by the given angle (degrees) around its centre.
+     * The output canvas expands to contain the full rotated content.
+     */
+    private Bitmap rotateBitmap(Bitmap src, float angleDegrees) {
+        double rad = Math.toRadians(angleDegrees);
+        float sinA = (float) Math.abs(Math.sin(rad));
+        float cosA = (float) Math.abs(Math.cos(rad));
+        int newWidth  = Math.round(src.getWidth() * cosA + src.getHeight() * sinA);
+        int newHeight = Math.round(src.getWidth() * sinA + src.getHeight() * cosA);
+
+        Matrix matrix = new Matrix();
+        matrix.setRotate(angleDegrees, src.getWidth() / 2f, src.getHeight() / 2f);
+        matrix.postTranslate((newWidth - src.getWidth()) / 2f, (newHeight - src.getHeight()) / 2f);
+
+        Bitmap result = Bitmap.createBitmap(newWidth, newHeight, Bitmap.Config.ARGB_8888);
+        android.graphics.Canvas canvas = new android.graphics.Canvas(result);
+        canvas.drawBitmap(src, matrix, null);
+        src.recycle();
+        return result;
+    }
+
+    /**
+     * Crops a square of `size` pixels from the centre of `src`.
+     * The centre of `src` is the (corrected) face centre.
+     */
+    private Bitmap centerSquareCrop(Bitmap src, int size) {
+        int side = Math.min(size, Math.min(src.getWidth(), src.getHeight()));
+        int x = (src.getWidth()  - side) / 2;
+        int y = (src.getHeight() - side) / 2;
+        Bitmap result = Bitmap.createBitmap(src, x, y, side, side);
+        src.recycle();
+        return result;
     }
 
     /**
